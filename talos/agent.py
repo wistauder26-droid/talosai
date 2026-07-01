@@ -59,18 +59,20 @@ class Agent:
         # confirm(command) -> bool für gefährliche Shell-Befehle
         self.on_tool = None
         self.confirm = None
+        # optionaler Modus-Zusatz zum System-Prompt (z.B. Coding-Modus)
+        self.mode_prompt = ""
 
     def _system(self) -> dict:
         if self.system_prompt:
             return {"role": "system", "content": self.system_prompt}
-        return {
-            "role": "system",
-            "content": SYSTEM_PROMPT.format(
-                memory_index=self.memory.index() or "(noch leer)",
-                lessons=self.memory.lessons() or "(noch keine)",
-                skills_index=self.skills.index() or "(noch keine)",
-            ),
-        }
+        content = SYSTEM_PROMPT.format(
+            memory_index=self.memory.index() or "(noch leer)",
+            lessons=self.memory.lessons() or "(noch keine)",
+            skills_index=self.skills.index() or "(noch keine)",
+        )
+        if self.mode_prompt:
+            content += f"\n## Aktueller Modus\n{self.mode_prompt}\n"
+        return {"role": "system", "content": content}
 
     def spawn_subagent(self, task: str) -> str:
         """Führt eine Teilaufgabe in einem frischen, kleinen Kontext aus."""
