@@ -1,61 +1,58 @@
 # TalosAI — Vision
 
-**Ein selbstlernender persönlicher AI-Agent mit erstklassiger nativer iOS-App.**
+**Ein selbstlernender, ehrlicher AI-Agent — open source, self-hostbar,
+erreichbar über Telegram.**
 
-## Warum TalosAI gewinnt
+## Strategie: Open Core
 
-Analyse der Konkurrenz (Stand Juli 2026):
+- **Basis auf GitHub (AGPL-3.0)**: Agent-Core, Telegram-Gateway,
+  Memory- und Learning-System, Self-Hosting via Docker. Jeder kann es
+  kostenlos selbst betreiben — mit vLLM/Ollama komplett lokal oder mit
+  einem API-Provider.
+- **Geld verdienen** mit dem, was Self-Hoster nicht wollen/können:
+  1. **TalosAI Cloud** — gehostete Version für Nicht-Techies (Abo).
+  2. **iOS-App** (Produkt Nr. 2, Apple-Design) — Premium-Frontend für
+     Cloud-Nutzer, Abo über den App Store.
+- AGPL schützt uns: Niemand kann TalosAI als Closed-Source-Cloud-Dienst
+  verkaufen; wir als Rechteinhaber dürfen unsere Cloud-Version frei
+  betreiben.
+
+## Konkurrenz (Stand Juli 2026)
 
 | | Odysseus | OpenClaw | Hermes Agent | **TalosAI** |
 |---|---|---|---|---|
-| Zielgruppe | Self-Hosting-Techies | Techies (CLI-Setup) | Techies (Terminal) | **Normale Nutzer (iPhone)** |
-| Selbstlernend | teilweise (Memory) | nein | ja (Skill-Loop) | **ja, Kernfeature** |
-| Native iOS-App | nein | rudimentär | nein | **ja, Apple-Design** |
-| Monetarisierung | keine (AGPL) | keine (Sponsoren) | keine (Forschung) | **App-Store-Abo** |
-| Token-Effizienz | – | – | Trajectory-Compression | **Kernprinzip** |
+| Learning-Loop | teilweise | nein | ja | **ja, Kernfeature** |
+| Ehrlichkeit/Verifier | nein | nein | nein | **ja, Kernfeature** |
+| Lokal (vLLM/Ollama) | ja | teilweise | ja | **ja** |
+| Telegram | nein | ja | ja | **ja, erster Kanal** |
+| Geschäftsmodell | keins | Sponsoren | keins | **Cloud + iOS-Abo** |
 
-Die Lücke: Alle drei sind Open-Source-Werkzeuge für Entwickler. Keiner
-verkauft ein poliertes Consumer-Produkt. TalosAI muss nicht technisch in
-allem überlegen sein — es muss das erste sein, das sich wie ein
-Apple-Produkt anfühlt.
+Differenzierung: nicht Feature-Breite (kein E-Mail-Client, kein
+Dokumenten-Editor wie Odysseus), sondern **Lernfähigkeit + Ehrlichkeit
++ Token-Effizienz** — und später das erste polierte Consumer-Frontend.
 
 ## Kernprinzipien
 
-1. **Selbstlernend** — Nach jeder abgeschlossenen Aufgabe reflektiert der
-   Agent: Was hat funktioniert, was nicht? Erkenntnisse werden als
-   Memory-Dateien und wiederverwendbare Skills gespeichert (Vorbild:
-   Hermes-Agent-Learning-Loop, MIT-lizenziert — Konzepte übernehmbar).
+1. **Selbstlernend** — Nach jeder Session reflektiert der Agent und
+   speichert Erkenntnisse als Memory-Dateien; sie fließen in zukünftige
+   System-Prompts ein.
 2. **Aus Fehlern lernen** — Fehlgeschlagene Tool-Calls und Nutzer-
-   Korrekturen werden protokolliert; eine Feedback-Datenbank fließt in
-   den System-Prompt zukünftiger Sessions ein.
-3. **Nicht lügen** — Jede Faktenaussage braucht eine Quelle (Tool-Ergebnis,
-   Memory, Web). Ohne Quelle sagt der Agent "weiß ich nicht". Erzwungen
-   durch Prompt-Design + einen Verifier-Schritt bei kritischen Antworten.
-4. **Token-effizient** — Prompt-Caching, Kontext-Kompaktierung,
-   Modell-Routing (Haiku für einfache Schritte, Fable/Opus für Planung),
-   Subagents mit eng geschnittenem Kontext statt einem fetten Hauptkontext.
-5. **Multi-Agent** — Ein Orchestrator plant, spezialisierte Subagents
-   (Recherche, Code, Schreiben, Kalender/Mail) führen aus.
-
-## Produkt
-
-- **Backend**: Agent-Server (Python, Claude Agent SDK), läuft in der Cloud.
-  Pro Nutzer ein isolierter Agent mit eigenem Memory.
-- **iOS-App**: SwiftUI, Apple Human Interface Guidelines. Chat, Sprach-
-  eingabe, Push bei fertigen Aufgaben, Widgets, Siri-Shortcuts.
-- **Monetarisierung**: Freemium-Abo (StoreKit 2). Free: begrenzte
-  Nachrichten/Monat auf kleinem Modell. Pro (~9,99 €/Monat): starkes
-  Modell, unbegrenztes Memory, Automationen. Marge über Modell-Routing
-  und Caching steuern.
+   Korrekturen landen als "Lessons" im Memory.
+3. **Nicht lügen** — Behauptungen brauchen eine Quelle (Tool-Ergebnis,
+   Memory); sonst sagt der Agent "weiß ich nicht". Verifier-Schritt für
+   kritische Antworten.
+4. **Token-effizient** — Modell-Routing (kleines Modell für einfache
+   Schritte), knappe Kontexte, Kompaktierung langer Sessions.
+5. **Multi-Agent** — Orchestrator + spezialisierte Subagents (ab v2).
+6. **Provider-agnostisch** — OpenAI-kompatible Schnittstelle: vLLM,
+   Ollama, OpenRouter, Anthropic/OpenAI — Wechsel per Config, kein
+   Lock-in.
 
 ## Roadmap
 
-- **Phase 1 (Wochen 1–4): Agent-Core** — Orchestrator + 2 Subagents,
-  Tool-Set (Web, Dateien, Kalender), Memory-System, Learning-Loop v1.
-  Testbar über CLI.
-- **Phase 2 (Wochen 5–8): Server + API** — FastAPI, Auth, Streaming
-  (SSE), Per-User-Isolation, Usage-Tracking/Billing-Grundlage.
-- **Phase 3 (Wochen 9–14): iOS-App** — SwiftUI-App gegen die API,
-  TestFlight-Beta.
-- **Phase 4 (Wochen 15+): Launch** — App-Store-Review, Abo live,
-  Feedback-Loop mit echten Nutzern.
+- **Phase 1: Open-Source-Basis** — Agent-Core, LLM-Layer, Memory +
+  Learning-Loop v1, Telegram-Gateway, CLI, Docker. → GitHub-Launch.
+- **Phase 2: Reife** — Multi-Agent, Verifier, Skills, Web-Tools,
+  Community aufbauen (Stars, Contributors).
+- **Phase 3: TalosAI Cloud** — gehostete Version, Abo-Billing.
+- **Phase 4: iOS-App** — SwiftUI, Apple HIG, App-Store-Abo.

@@ -1,57 +1,62 @@
-# TalosAI — Architektur
+# TalosAI — Architektur (Phase 1)
 
 ```
-┌─────────────── iOS-App (SwiftUI) ───────────────┐
-│ Chat · Voice · Push · Widgets · StoreKit-Abo    │
-└───────────────────────┬─────────────────────────┘
-                        │ HTTPS / SSE-Streaming
-┌───────────────────────▼─────────────────────────┐
-│ API-Server (FastAPI)                            │
-│ Auth (Sign in with Apple) · Rate-Limits ·       │
-│ Usage-Tracking · Abo-Validierung                │
-└───────────────────────┬─────────────────────────┘
-┌───────────────────────▼─────────────────────────┐
-│ Agent-Runtime (Claude Agent SDK, pro Nutzer)    │
-│                                                 │
-│  Orchestrator (starkes Modell)                  │
-│   ├── Recherche-Subagent   (Haiku, Web-Tools)   │
-│   ├── Schreib-Subagent     (Sonnet)             │
-│   └── Aufgaben-Subagent    (Haiku, Kalender…)   │
-│                                                 │
-│  Learning-Loop:                                 │
-│   Session-Ende → Reflexion → Memory/Skill-Datei │
-│   Fehler-Log → fließt in nächsten System-Prompt │
-└───────────────────────┬─────────────────────────┘
-┌───────────────────────▼─────────────────────────┐
-│ Storage: Postgres (Nutzer, Sessions, Usage)     │
-│ + Memory-Dateien pro Nutzer (verschlüsselt)     │
-└─────────────────────────────────────────────────┘
+┌── Kanäle ─────────────────────────────────────────┐
+│  Telegram-Gateway        CLI (lokal)              │
+└───────────────┬───────────────┬───────────────────┘
+                ▼               ▼
+┌───────────────────────────────────────────────────┐
+│ Agent-Core (talos/agent.py)                       │
+│  Agent-Loop: Prompt → LLM → Tool-Calls → Antwort  │
+│  Ehrlichkeits-Regeln im System-Prompt             │
+│  Tools: memory, files, shell                      │
+├───────────────────────────────────────────────────┤
+│ Memory + Learning (talos/memory.py, learning.py)  │
+│  memory/MEMORY.md   Index, in jeden Prompt geladen│
+│  memory/*.md        einzelne Fakten               │
+│  memory/lessons.md  Erkenntnisse aus Reflexion    │
+│  Session-Ende → Selbstreflexion → Lessons         │
+├───────────────────────────────────────────────────┤
+│ LLM-Layer (talos/llm.py) — provider-agnostisch    │
+│  OpenAI-kompatible API: vLLM · Ollama · OpenRouter│
+│  · OpenAI · Anthropic (via Kompatibilitäts-API)   │
+│  Konfiguration über .env: BASE_URL, MODEL, KEY    │
+└───────────────────────────────────────────────────┘
 ```
 
 ## Entscheidungen
 
-- **Claude Agent SDK statt Eigenbau**: Agent-Loop, Tool-Handling,
-  Subagents, Kontext-Kompaktierung und Prompt-Caching sind gelöst —
-  wir bauen nur die Schicht darüber (Memory, Learning, Produkt).
-- **Modell-Routing für Token-Effizienz**: Orchestrator entscheidet pro
-  Schritt das billigste ausreichende Modell. Prompt-Caching überall.
-- **Ehrlichkeit als Verifier**: Kritische Antworten laufen durch einen
-  billigen Check "Ist jede Behauptung durch Tool-Output gedeckt?" —
-  sonst wird umformuliert oder Unsicherheit ausgewiesen.
-- **Memory als Dateien, nicht Vektor-DB (v1)**: Ein MEMORY-Index +
-  einzelne Fakten-Dateien, vom Agenten selbst kuratiert (Muster von
-  Hermes Agent, MIT). Vektor-Suche erst, wenn nötig.
-- **Kein Code aus Odysseus übernehmen** (AGPL → würde uns zwingen,
-  alles offenzulegen). Hermes/OpenClaw (MIT) sind als Vorlage okay.
+- **Eigener schlanker Agent-Loop statt Claude Agent SDK** — das SDK ist
+  Claude-gebunden; Provider-Freiheit (vLLM lokal!) ist Kernversprechen.
+- **OpenAI-kompatibles Wire-Format** als kleinster gemeinsamer Nenner:
+  vLLM, Ollama, OpenRouter und OpenAI sprechen es nativ, Anthropic über
+  die Kompatibilitäts-Schicht. Ein Client, alle Provider.
+- **Memory als Markdown-Dateien**, vom Agenten selbst kuratiert
+  (Muster: Hermes Agent, MIT). Index (`MEMORY.md`) kommt in jeden
+  System-Prompt; Details werden per Tool nachgeladen. Vektor-DB erst,
+  wenn Dateien nicht mehr reichen.
+- **Learning-Loop v1**: Am Session-Ende beantwortet das Modell drei
+  Fragen (Was lief gut? Was schlug fehl und warum? Was sollte ich mir
+  merken?) und schreibt das Ergebnis nach `lessons.md` — die in jede
+  neue Session eingespeist wird.
+- **AGPL-3.0** für die Basis. Kein Code aus Odysseus (ebenfalls AGPL,
+  aber fremdes Copyright); Konzepte aus Hermes/OpenClaw (MIT) okay.
 
-## Repo-Struktur (Ziel)
+## Repo-Struktur
 
 ```
 TalosAI/
-├── agent/          # Agent-Core: Orchestrator, Subagents, Tools
-│   ├── memory/     # Memory- & Learning-Loop
-│   └── skills/     # selbst erzeugte + mitgelieferte Skills
-├── server/         # FastAPI: Auth, Streaming, Billing
-├── ios/            # SwiftUI-App (Xcode-Projekt)
-└── docs/
+├── talos/
+│   ├── config.py        # .env-Konfiguration
+│   ├── llm.py           # provider-agnostischer LLM-Client
+│   ├── agent.py         # Agent-Loop + System-Prompt
+│   ├── tools.py         # Tool-Registry + Implementierungen
+│   ├── memory.py        # Memory-Dateien + Index
+│   ├── learning.py      # Session-Reflexion → Lessons
+│   ├── cli.py           # lokales Chat-REPL
+│   └── gateway/
+│       └── telegram.py  # Telegram-Bot
+├── docker-compose.yml   # Talos + optional vLLM/Ollama
+├── pyproject.toml
+└── .env.example
 ```
