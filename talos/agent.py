@@ -33,6 +33,8 @@ class Agent:
         self.memory = Memory(self.cfg.data_dir / "memory")
         self.session_id = session_id
         self.messages: list[dict] = []
+        # optionaler Callback (tool_name, args) — z.B. für Live-Anzeige im CLI
+        self.on_tool = None
 
     def _system(self) -> dict:
         return {
@@ -60,9 +62,10 @@ class Agent:
                 }
             )
             for tc in msg.tool_calls:
-                result = execute_tool(
-                    tc.function.name, parse_args(tc.function.arguments), self.memory
-                )
+                args = parse_args(tc.function.arguments)
+                if self.on_tool:
+                    self.on_tool(tc.function.name, args)
+                result = execute_tool(tc.function.name, args, self.memory)
                 self.messages.append(
                     {"role": "tool", "tool_call_id": tc.id, "content": result}
                 )
