@@ -108,6 +108,14 @@ PAGE = """<!doctype html>
   .badge{font-size:11px;color:var(--muted);background:var(--chip);padding:3px 10px;
          border-radius:10px}
   #usage{margin-left:auto}
+  #graphwrap{position:relative;border-radius:var(--radius);overflow:hidden;
+        background:#0d1526;transition:height .3s ease;height:200px;flex-shrink:0}
+  #graphwrap.hidden{height:0}
+  #graph{width:100%;height:100%;display:block}
+  #graphtoggle{position:absolute;top:8px;right:10px;background:rgba(255,255,255,.08);
+        border:none;color:#8ea0c0;font-size:11px;padding:4px 10px;border-radius:10px;
+        cursor:pointer;z-index:2}
+  #graphlabel{position:absolute;bottom:8px;left:12px;color:#4a5a78;font-size:11px;z-index:2}
   #chat{flex:1;overflow-y:auto;padding:14px 4px;display:flex;flex-direction:column;gap:10px}
   .msg{max-width:84%;padding:11px 15px;border-radius:var(--radius);line-height:1.55;
        font-size:15px;word-break:break-word}
@@ -160,6 +168,11 @@ PAGE = """<!doctype html>
     <span class="badge" id="model"></span>
     <span class="badge" id="usage">0 Tokens</span>
   </header>
+  <div id="graphwrap">
+    <canvas id="graph"></canvas>
+    <button id="graphtoggle">ausblenden</button>
+    <span id="graphlabel">Agenten-Aktivität</span>
+  </div>
   <div id="chat"></div>
   <div id="suggestions">
     <button>Was weißt du über mich?</button>
@@ -182,6 +195,65 @@ PAGE = """<!doctype html>
 <script>
 const chat=document.getElementById('chat'),inp=document.getElementById('inp'),
       send=document.getElementById('send'),sugg=document.getElementById('suggestions');
+
+// ===== Live-Aktivitätsgraph =====
+const gw=document.getElementById('graphwrap'),cv=document.getElementById('graph'),
+      gctx=cv.getContext('2d');
+document.getElementById('graphtoggle').onclick=function(){
+  gw.classList.toggle('hidden');
+  this.textContent=gw.classList.contains('hidden')?'Graph einblenden':'ausblenden'};
+function gsize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=cv.clientHeight*devicePixelRatio;
+  gctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0)}
+addEventListener('resize',gsize);
+
+const COLORS={talos:'#ffffff',delegate:'#7aa2ff',web_search:'#5ac8fa',web_fetch:'#5ac8fa',
+  shell:'#ffd60a',memory_save:'#bf5af2',memory_read:'#bf5af2',skill_save:'#30d158',
+  skill_read:'#30d158',default:'#98989d'};
+let gnodes=[],gedges=[],ambient=[],hub=null,busy=false;
+function initGraph(){
+  const W=cv.clientWidth,H=cv.clientHeight;
+  ambient=Array.from({length:70},()=>({x:Math.random()*W,y:Math.random()*H,
+    r:.8+Math.random()*1.4,tw:Math.random()*6.28}));
+  gnodes=[{id:'talos',label:'Talos',x:W/2,y:H/2,tx:W/2,ty:H/2,r:7,color:COLORS.talos,
+    born:0,perm:true}];
+  gedges=[];hub=gnodes[0]}
+function addGraphNode(name,detail){
+  const W=cv.clientWidth,H=cv.clientHeight,now=performance.now();
+  const parent=(name==='delegate')?gnodes[0]:hub;
+  const ang=Math.random()*6.28,dist=45+Math.random()*40;
+  const n={id:name+now,label:name,x:parent.x,y:parent.y,
+    tx:Math.min(W-20,Math.max(20,parent.x+Math.cos(ang)*dist)),
+    ty:Math.min(H-16,Math.max(16,parent.y+Math.sin(ang)*dist)),
+    r:name==='delegate'?5.5:3.5,color:COLORS[name]||COLORS.default,born:now,perm:false};
+  gnodes.push(n);gedges.push({a:parent,b:n,born:now});
+  if(name==='delegate')hub=n;
+  if(gnodes.length>60){gnodes.splice(1,1);gedges.splice(0,1)}}
+function drawGraph(t){
+  const W=cv.clientWidth,H=cv.clientHeight;
+  gctx.clearRect(0,0,W,H);
+  // Ambient-Sterne
+  for(const a of ambient){const tw=.25+.2*Math.sin(t/900+a.tw);
+    gctx.fillStyle='rgba(180,195,225,'+tw+')';
+    gctx.beginPath();gctx.arc(a.x,a.y,a.r,0,6.28);gctx.fill()}
+  // Kanten
+  for(const e of gedges){const age=(t-e.born)/1000,alpha=Math.min(.5,age*2)*(busy?1:.55);
+    gctx.strokeStyle='rgba(120,150,210,'+alpha+')';gctx.lineWidth=.7;
+    gctx.beginPath();gctx.moveTo(e.a.x,e.a.y);gctx.lineTo(e.b.x,e.b.y);gctx.stroke()}
+  // Knoten
+  for(const n of gnodes){
+    n.x+=(n.tx-n.x)*.08;n.y+=(n.ty-n.y)*.08;
+    const age=(t-n.born)/1000;
+    let r=n.r;
+    if(n.perm&&busy)r=n.r+1.6*Math.sin(t/280);           // Puls, wenn Talos arbeitet
+    else if(age<.5)r=n.r*(age*2);                        // Einblendung
+    gctx.fillStyle=n.color;
+    gctx.shadowColor=n.color;gctx.shadowBlur=n.perm||age<2?10:4;
+    gctx.beginPath();gctx.arc(n.x,n.y,Math.max(r,0),0,6.28);gctx.fill();
+    gctx.shadowBlur=0;
+    if(n.perm||age<6){gctx.fillStyle='rgba(160,180,215,'+(n.perm?.9:Math.max(0,1-age/6))+')';
+      gctx.font='10px -apple-system';gctx.fillText(n.label,n.x+8,n.y+3)}}
+  requestAnimationFrame(drawGraph)}
+gsize();initGraph();requestAnimationFrame(drawGraph);
 
 function el(cls,html){const d=document.createElement('div');d.className=cls;
   if(html!==undefined)d.innerHTML=html;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d}
@@ -227,6 +299,7 @@ else{const rec=new SR();rec.lang='de-DE';rec.interimResults=true;let listening=f
 // ===== Chat mit Live-Streaming =====
 async function sendMessage(text){
   addUser(text);sugg.style.display='none';send.disabled=true;
+  busy=true;hub=gnodes[0];
   const typing=el('typing');
   try{
     const resp=await fetch('/api/chat/stream',{method:'POST',
@@ -238,10 +311,11 @@ async function sendMessage(text){
         const line=buf.slice(0,idx).trim();buf=buf.slice(idx+2);
         if(!line.startsWith('data: '))continue;
         const ev=JSON.parse(line.slice(6));
-        if(ev.type==='tool')addTool(ev);
+        if(ev.type==='tool'){addTool(ev);addGraphNode(ev.name,ev.detail)}
         else if(ev.type==='reply'){typing.remove();addBot(ev.text);speak(ev.text);
           updateUsage(ev.usage)}}}
   }catch(err){typing.remove();addBot('**Fehler:** '+err)}
+  busy=false;hub=gnodes[0];
   send.disabled=false;inp.focus();refreshState()}
 
 document.getElementById('form').onsubmit=e=>{e.preventDefault();
