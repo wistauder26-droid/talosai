@@ -166,6 +166,75 @@ def session_load(body: SessionIn):
     return {"id": d["id"], "history": history}
 
 
+@app.get("/api/graph")
+def graph():
+    """Wissens-Graph im Obsidian-Stil: Memory, Skills, Lektionen + Links."""
+    import re as _re
+
+    nodes = [
+        {"id": "talos", "label": "Talos", "type": "hub", "content": ""},
+        {"id": "hub-mem", "label": "Gedächtnis", "type": "hub", "content": ""},
+        {"id": "hub-skill", "label": "Skills", "type": "hub", "content": ""},
+        {"id": "hub-lesson", "label": "Lektionen", "type": "hub", "content": ""},
+    ]
+    links = [{"a": "talos", "b": "hub-mem"}, {"a": "talos", "b": "hub-skill"},
+             {"a": "talos", "b": "hub-lesson"}]
+    mem_ids = set()
+    for p in sorted(_agent.memory.dir.glob("*.md")):
+        if p.name == "MEMORY.md" or p.name == "lessons.md":
+            continue
+        nid = f"mem-{p.stem}"
+        mem_ids.add(p.stem)
+        nodes.append({"id": nid, "label": p.stem, "type": "memory",
+                      "content": p.read_text()[:2000]})
+        links.append({"a": "hub-mem", "b": nid})
+    # [[wiki-links]] zwischen Memory-Einträgen
+    for p in _agent.memory.dir.glob("*.md"):
+        if p.stem in mem_ids:
+            for target in _re.findall(r"\[\[([\w-]+)\]\]", p.read_text()):
+                if target in mem_ids and target != p.stem:
+                    links.append({"a": f"mem-{p.stem}", "b": f"mem-{target}"})
+    for p in sorted(_agent.skills.dir.glob("*.md")):
+        nid = f"skill-{p.stem}"
+        nodes.append({"id": nid, "label": p.stem, "type": "skill",
+                      "content": p.read_text()[:2000]})
+        links.append({"a": "hub-skill", "b": nid})
+    for i, line in enumerate(_agent.memory.lessons().splitlines()):
+        line = line.lstrip("- ").strip()
+        if line:
+            nodes.append({"id": f"lesson-{i}", "label": line[:32] + ("…" if len(line) > 32 else ""),
+                          "type": "lesson", "content": line})
+            links.append({"a": "hub-lesson", "b": f"lesson-{i}"})
+    return {"nodes": nodes, "links": links}
+
+
+class TTSIn(BaseModel):
+    text: str
+
+
+@app.post("/api/tts")
+def tts(body: TTSIn):
+    """Sprachausgabe über ElevenLabs (Fallback im Frontend: Browser-Stimme)."""
+    if not _cfg.eleven_key:
+        return {"error": "kein ElevenLabs-Key konfiguriert"}
+    import httpx
+    from fastapi.responses import Response
+
+    resp = httpx.post(
+        f"https://api.elevenlabs.io/v1/text-to-speech/{_cfg.eleven_voice}",
+        headers={"xi-api-key": _cfg.eleven_key},
+        json={
+            "text": body.text[:900],
+            "model_id": "eleven_multilingual_v2",
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+        },
+        timeout=60,
+    )
+    if resp.status_code != 200:
+        return {"error": f"ElevenLabs: HTTP {resp.status_code}"}
+    return Response(content=resp.content, media_type="audio/mpeg")
+
+
 @app.get("/api/state")
 def state():
     return {
@@ -272,6 +341,18 @@ PAGE = """<!doctype html>
   #ctxbar{height:6px;background:rgba(128,128,128,.25);border-radius:3px;margin-top:6px;overflow:hidden}
   #ctxfill{height:100%;width:0%;background:#30d158;border-radius:3px;transition:width .4s}
   #ctxfill.warn{background:#ffd60a}#ctxfill.crit{background:#ff453a}
+  /* ===== Obsidian-Wissensgraph (Vollbild-View) ===== */
+  #knowview{display:none;flex:1;position:relative;background:#0d1526;border-radius:var(--radius);
+        overflow:hidden;margin:8px 0}
+  #knowview.show{display:block}
+  #kcanvas{width:100%;height:100%;display:block;cursor:grab}
+  #kdetail{position:absolute;top:14px;right:14px;width:280px;max-height:70%;overflow-y:auto;
+        background:rgba(20,28,48,.92);border:1px solid #2a3a5c;border-radius:12px;padding:14px;
+        color:#dce4f5;font-size:12.5px;line-height:1.6;display:none;backdrop-filter:blur(8px)}
+  #kdetail h3{font-size:13px;margin-bottom:6px;color:#fff}
+  #kdetail pre{white-space:pre-wrap;word-break:break-word;font:11.5px/1.6 ui-monospace,Menlo,monospace}
+  #khint{position:absolute;bottom:10px;left:14px;color:#4a5a78;font-size:11px}
+  body.knowledge #chat,body.knowledge #suggestions,body.knowledge #form{display:none}
   @media(max-width:1100px){aside{display:none}}
   @media(max-width:800px){nav{display:none}}
 </style></head><body>
@@ -282,6 +363,7 @@ PAGE = """<!doctype html>
   <div class="sect">Modus</div>
   <button id="mode-chat" onclick="setMode('chat')">💬 Chat</button>
   <button id="mode-coden" onclick="setMode('coden')">⌨️ Coden</button>
+  <button id="mode-wissen" onclick="showKnowledge()">🕸 Wissen</button>
   <div class="sect">Verlauf</div>
   <div id="history"></div>
 </nav>
@@ -291,6 +373,11 @@ PAGE = """<!doctype html>
     <h1 id="modetitle">Chat</h1>
     <span class="badge" id="model"></span>
   </header>
+  <div id="knowview">
+    <canvas id="kcanvas"></canvas>
+    <div id="kdetail"></div>
+    <span id="khint">Ziehen: Knoten bewegen · Scrollen: Zoom · Klick: Details</span>
+  </div>
   <div id="chat"></div>
   <div id="suggestions">
     <button>Was weißt du über mich?</button>
@@ -345,25 +432,34 @@ function updateUsage(u){if(!u)return;
   const f=document.getElementById('ctxfill');f.style.width=pct+'%';
   f.className=pct>80?'crit':pct>50?'warn':''}
 
-// ===== Sprachausgabe (TTS) — robust gegen Browser-Eigenheiten =====
-let ttsOn=false,voices=[];
+// ===== Sprachausgabe: ElevenLabs, Fallback Browser-Stimme =====
+let ttsOn=false,voices=[],audioEl=null;
 function loadVoices(){voices=speechSynthesis.getVoices()}
 loadVoices();speechSynthesis.onvoiceschanged=loadVoices;
 const ttsBtn=document.getElementById('tts');
 ttsBtn.onclick=()=>{ttsOn=!ttsOn;ttsBtn.classList.toggle('on',ttsOn);
-  if(ttsOn){speak('Sprachausgabe aktiviert.',true)}else{speechSynthesis.cancel()}};
-function speak(text,force){
+  if(ttsOn){speak('Sprachausgabe aktiviert.',true)}else{stopSpeaking()}};
+function stopSpeaking(){speechSynthesis.cancel();
+  if(audioEl){audioEl.pause();audioEl=null}}
+function plainText(text){return text.replace(/```[\\s\\S]*?```/g,' Codeblock. ')
+  .replace(/`[^`]*`/g,'').replace(/\\[(.*?)\\]\\([^)]*\\)/g,'$1')
+  .replace(/[*_#>|]/g,'').replace(/\\s+/g,' ').trim()}
+async function speak(text,force){
   if(!ttsOn&&!force)return;
-  speechSynthesis.cancel();
-  const plain=text.replace(/```[\\s\\S]*?```/g,' Codeblock. ').replace(/`[^`]*`/g,'')
-    .replace(/\\[(.*?)\\]\\([^)]*\\)/g,'$1').replace(/[*_#>|]/g,'').replace(/\\s+/g,' ').trim();
-  if(!plain)return;
+  stopSpeaking();
+  const plain=plainText(text);if(!plain)return;
+  // 1. Versuch: ElevenLabs über den Server
+  try{
+    const r=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({text:plain})});
+    if(r.ok&&(r.headers.get('content-type')||'').includes('audio')){
+      audioEl=new Audio(URL.createObjectURL(await r.blob()));audioEl.play();return}
+  }catch(e){}
+  // 2. Fallback: Browser-Stimme (in Sätzen — lange Utterances brechen ab)
   const voice=voices.find(v=>v.lang==='de-DE')||voices.find(v=>v.lang.startsWith('de'));
-  // In Sätze aufteilen — lange Utterances brechen in Chrome/Safari ab
   const parts=plain.match(/[^.!?]+[.!?]*/g)||[plain];
   for(const p of parts){const u=new SpeechSynthesisUtterance(p.trim());
     u.lang='de-DE';u.rate=1.05;if(voice)u.voice=voice;speechSynthesis.speak(u)}
-  // Chrome-Bug: Ausgabe stoppt nach ~15s — regelmäßig anstoßen
   clearInterval(window._ttsKick);
   window._ttsKick=setInterval(()=>{if(!speechSynthesis.speaking)clearInterval(window._ttsKick);
     else{speechSynthesis.pause();speechSynthesis.resume()}},10000)}
@@ -422,6 +518,85 @@ function drawGraph(t){const W=cv.clientWidth,H=cv.clientHeight;
   requestAnimationFrame(drawGraph)}
 gsize();initGraph();requestAnimationFrame(drawGraph);
 
+// ===== Obsidian-Wissensgraph =====
+const kview=document.getElementById('knowview'),kcv=document.getElementById('kcanvas'),
+      kctx=kcv.getContext('2d'),kdetail=document.getElementById('kdetail');
+const KCOLORS={hub:'#ffffff',memory:'#bf5af2',skill:'#30d158',lesson:'#ff9f0a'};
+let knodes=[],klinks=[],kcam={x:0,y:0,z:1},kdrag=null,kpan=null,kactive=false;
+function ksize(){kcv.width=kcv.clientWidth*devicePixelRatio;kcv.height=kcv.clientHeight*devicePixelRatio}
+async function loadKnowledge(){
+  const d=await (await fetch('/api/graph')).json();
+  const W=kcv.clientWidth,H=kcv.clientHeight;
+  knodes=d.nodes.map(n=>({...n,
+    x:W/2+(Math.random()-.5)*W*.6,y:H/2+(Math.random()-.5)*H*.6,vx:0,vy:0,
+    r:n.type==='hub'?(n.id==='talos'?10:7):5,color:KCOLORS[n.type]||'#98989d'}));
+  const byId=Object.fromEntries(knodes.map(n=>[n.id,n]));
+  klinks=d.links.map(l=>({a:byId[l.a],b:byId[l.b]})).filter(l=>l.a&&l.b);
+  const t=byId['talos'];if(t){t.x=W/2;t.y=H/2}}
+function kstep(){
+  // Abstoßung zwischen allen Knoten
+  for(let i=0;i<knodes.length;i++)for(let j=i+1;j<knodes.length;j++){
+    const a=knodes[i],b=knodes[j];let dx=b.x-a.x,dy=b.y-a.y;
+    let d2=dx*dx+dy*dy;if(d2<1)d2=1;const d=Math.sqrt(d2);
+    const f=Math.min(1200/d2,4);dx/=d;dy/=d;
+    a.vx-=dx*f;a.vy-=dy*f;b.vx+=dx*f;b.vy+=dy*f}
+  // Federn entlang der Kanten
+  for(const l of klinks){let dx=l.b.x-l.a.x,dy=l.b.y-l.a.y;
+    const d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-70)*.01;dx/=d;dy/=d;
+    l.a.vx+=dx*f*d*.02;l.a.vy+=dy*f*d*.02;l.b.vx-=dx*f*d*.02;l.b.vy-=dy*f*d*.02}
+  // leichte Zentrierung + Dämpfung
+  const W=kcv.clientWidth,H=kcv.clientHeight;
+  for(const n of knodes){
+    n.vx+=(W/2-n.x)*.0006;n.vy+=(H/2-n.y)*.0006;
+    if(kdrag!==n){n.x+=n.vx*=.85;n.y+=n.vy*=.85}}}
+function kdraw(){
+  if(!kactive)return;
+  kstep();
+  const dpr=devicePixelRatio,W=kcv.clientWidth,H=kcv.clientHeight;
+  kctx.setTransform(dpr,0,0,dpr,0,0);kctx.clearRect(0,0,W,H);
+  kctx.setTransform(dpr*kcam.z,0,0,dpr*kcam.z,dpr*kcam.x,dpr*kcam.y);
+  for(const l of klinks){kctx.strokeStyle='rgba(120,150,210,.35)';kctx.lineWidth=.8/kcam.z;
+    kctx.beginPath();kctx.moveTo(l.a.x,l.a.y);kctx.lineTo(l.b.x,l.b.y);kctx.stroke()}
+  for(const n of knodes){
+    kctx.fillStyle=n.color;kctx.shadowColor=n.color;kctx.shadowBlur=n.type==='hub'?12:5;
+    kctx.beginPath();kctx.arc(n.x,n.y,n.r,0,6.28);kctx.fill();kctx.shadowBlur=0;
+    if(kcam.z>0.55||n.type==='hub'){
+      kctx.fillStyle='rgba(190,205,235,.85)';kctx.font=(n.type==='hub'?11:9.5)+'px -apple-system';
+      kctx.fillText(n.label,n.x+n.r+3,n.y+3)}}
+  requestAnimationFrame(kdraw)}
+function kpos(e){const rect=kcv.getBoundingClientRect();
+  return {x:(e.clientX-rect.left-kcam.x)/kcam.z,y:(e.clientY-rect.top-kcam.y)/kcam.z}}
+function kfind(p){return knodes.find(n=>{const dx=n.x-p.x,dy=n.y-p.y;
+  return dx*dx+dy*dy<(n.r+6)*(n.r+6)})}
+kcv.addEventListener('mousedown',e=>{const p=kpos(e),n=kfind(p);
+  if(n){kdrag=n;kdrag._moved=false}else{kpan={x:e.clientX-kcam.x,y:e.clientY-kcam.y}}});
+addEventListener('mousemove',e=>{
+  if(kdrag){const p=kpos(e);kdrag.x=p.x;kdrag.y=p.y;kdrag.vx=kdrag.vy=0;kdrag._moved=true}
+  else if(kpan){kcam.x=e.clientX-kpan.x;kcam.y=e.clientY-kpan.y}});
+addEventListener('mouseup',e=>{
+  if(kdrag&&!kdrag._moved){
+    kdetail.style.display='block';
+    kdetail.innerHTML='<h3>'+kdrag.label+'</h3><pre>'+
+      (kdrag.content||'('+kdrag.type+')').replace(/</g,'&lt;')+'</pre>'}
+  kdrag=null;kpan=null});
+kcv.addEventListener('wheel',e=>{e.preventDefault();
+  const f=e.deltaY<0?1.1:0.9,rect=kcv.getBoundingClientRect(),
+        mx=e.clientX-rect.left,my=e.clientY-rect.top;
+  kcam.x=mx-(mx-kcam.x)*f;kcam.y=my-(my-kcam.y)*f;kcam.z*=f},{passive:false});
+async function showKnowledge(){
+  document.body.classList.add('knowledge');kview.classList.add('show');
+  document.getElementById('modetitle').textContent='Wissen';
+  document.getElementById('mode-wissen').classList.add('active');
+  document.getElementById('mode-chat').classList.remove('active');
+  document.getElementById('mode-coden').classList.remove('active');
+  ksize();kcam={x:0,y:0,z:1};kdetail.style.display='none';
+  await loadKnowledge();
+  if(!kactive){kactive=true;requestAnimationFrame(kdraw)}}
+function hideKnowledge(){document.body.classList.remove('knowledge');
+  kview.classList.remove('show');kactive=false;
+  document.getElementById('mode-wissen').classList.remove('active')}
+addEventListener('resize',()=>{if(kactive)ksize()});
+
 // ===== Sessions / Verlauf / Modus =====
 async function refreshSessions(){const s=await (await fetch('/api/sessions')).json();
   const h=document.getElementById('history');h.innerHTML='';
@@ -433,12 +608,12 @@ function setModeUI(){document.getElementById('mode-chat').classList.toggle('acti
   document.getElementById('mode-coden').classList.toggle('active',mode==='coden');
   document.getElementById('modetitle').textContent=mode==='coden'?'Coden':'Chat';
   inp.placeholder=mode==='coden'?'Was soll ich bauen?':'Nachricht an Talos…'}
-async function setMode(m){mode=m;await newSession()}
-async function newSession(){await fetch('/api/session/new',{method:'POST',
+async function setMode(m){hideKnowledge();mode=m;await newSession()}
+async function newSession(){hideKnowledge();await fetch('/api/session/new',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
   chat.innerHTML='';sugg.style.display='flex';initGraph();setModeUI();
   refreshSessions();refreshState()}
-async function loadSession(id){const r=await (await fetch('/api/session/load',{method:'POST',
+async function loadSession(id){hideKnowledge();const r=await (await fetch('/api/session/load',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({id,mode})})).json();
   if(r.error)return;chat.innerHTML='';sugg.style.display='none';initGraph();
   for(const m of r.history){m.role==='user'?addUser(m.text):addBot(m.text)}

@@ -25,6 +25,10 @@ class Config:
         default_factory=lambda: [int(x) for x in os.getenv("TALOS_TELEGRAM_ALLOWED", "").split(",") if x.strip()]
     )
 
+    # ElevenLabs (hochwertige Sprachausgabe; leer = Browser-Stimme)
+    eleven_key: str = field(default_factory=lambda: os.getenv("TALOS_ELEVENLABS_KEY", ""))
+    eleven_voice: str = field(default_factory=lambda: os.getenv("TALOS_ELEVENLABS_VOICE", "pNInz6obpgDQGcFmaJgB"))
+
     # Daten-Verzeichnis (Memory, Sessions)
     data_dir: Path = field(default_factory=lambda: Path(os.getenv("TALOS_DATA_DIR", "data")))
 
