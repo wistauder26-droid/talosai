@@ -5,6 +5,7 @@ from __future__ import annotations
 from .config import Config
 from .llm import LLM
 from .memory import Memory
+from .skills import Skills
 from .tools import SUBAGENT_TOOLS, execute_tool, parse_args, tool_defs
 
 SYSTEM_PROMPT = """Du bist Talos, ein persönlicher AI-Agent.
@@ -15,8 +16,9 @@ gesichertes Wissen gedeckt ist. Wenn du etwas nicht weißt oder ein Tool \
 fehlschlug, sage das offen. Erfinde niemals Fakten, Quellen oder Ergebnisse. \
 Bei Fragen zu aktuellen oder überprüfbaren Fakten: erst web_search, dann antworten.
 2. LERNEN: Speichere wichtige Fakten über den Nutzer und laufende Projekte \
-mit memory_save. Wenn ein Vorgehen fehlschlägt und du die Ursache erkennst, \
-merke dir die Lektion.
+mit memory_save. Nach komplexen, gelungenen Aufgaben: Erstelle mit skill_save \
+eine wiederverwendbare Anleitung. Existiert für eine Aufgabe schon ein Skill, \
+lade ihn ZUERST mit skill_read — und verbessere ihn, wenn du dazulernst.
 3. EFFIZIENZ: Antworte knapp. Nutze Tools gezielt statt zu raten. Delegiere \
 umfangreiche Recherchen mit delegate an einen Subagenten, damit dein Kontext \
 schlank bleibt.
@@ -26,6 +28,9 @@ schlank bleibt.
 
 ## Lektionen aus früheren Sessions
 {lessons}
+
+## Deine Skills (per skill_read laden)
+{skills_index}
 """
 
 SUBAGENT_PROMPT = """Du bist ein Subagent von Talos. Erledige exakt die gestellte \
@@ -45,6 +50,7 @@ class Agent:
         self.cfg = cfg or Config()
         self.llm = LLM(self.cfg)
         self.memory = Memory(self.cfg.data_dir / "memory")
+        self.skills = Skills(self.cfg.data_dir / "skills")
         self.session_id = session_id
         self.messages: list[dict] = []
         self.allowed_tools = allowed_tools
@@ -62,6 +68,7 @@ class Agent:
             "content": SYSTEM_PROMPT.format(
                 memory_index=self.memory.index() or "(noch leer)",
                 lessons=self.memory.lessons() or "(noch keine)",
+                skills_index=self.skills.index() or "(noch keine)",
             ),
         }
 

@@ -16,8 +16,9 @@ erreichbar über Telegram oder das Terminal.**
 ```bash
 git clone <repo-url> && cd TalosAI
 cp .env.example .env        # Provider + Modell eintragen
-pip install -e .
+pip install .
 talos                        # Chat im Terminal
+talos-web                    # lokales Dashboard: http://localhost:7777
 talos-telegram               # oder als Telegram-Bot
 ```
 
@@ -40,10 +41,18 @@ talos
 
 1. Während der Session speichert der Agent wichtige Fakten per
    `memory_save` (Index in `data/memory/MEMORY.md`).
-2. Am Session-Ende (CLI-Exit oder `/reset` in Telegram) reflektiert er:
-   Was lief gut, was schlug fehl, was ist zu merken? → `lessons.md`.
-3. Index + Lektionen werden in jeden zukünftigen System-Prompt geladen —
-   der Agent wird mit jeder Session besser.
+2. Nach komplexen, gelungenen Aufgaben erstellt er mit `skill_save` eine
+   wiederverwendbare Anleitung — und verbessert sie bei erneuter Nutzung.
+3. Am Session-Ende (CLI-Exit, `/reset` in Telegram, "Session beenden" im
+   Dashboard) reflektiert er: Was lief gut, was schlug fehl? → `lessons.md`.
+4. Memory-Index, Skills und Lektionen werden in jeden zukünftigen
+   System-Prompt geladen — der Agent wird mit jeder Session besser.
+
+Außerdem: **Verifier** — nach jedem Turn mit Tool-Nutzung prüft ein
+günstiges Modell, ob die Antwort durch die Tool-Ergebnisse gedeckt ist;
+ungedeckte Behauptungen müssen korrigiert werden. **Subagents** — das
+`delegate`-Tool erledigt Recherchen in frischem, kleinem Kontext.
+**Web-Tools** — `web_search` (DuckDuckGo) und `web_fetch` ohne API-Key.
 
 ## Sicherheit
 

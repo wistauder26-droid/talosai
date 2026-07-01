@@ -84,6 +84,34 @@ TOOL_DEFS: list[dict[str, Any]] = [
     {
         "type": "function",
         "function": {
+            "name": "skill_save",
+            "description": "Erstellt oder verbessert einen wiederverwendbaren Skill (Schritt-für-Schritt-Anleitung für eine Aufgabenart). Nutze das nach komplexen, gelungenen Aufgaben — und aktualisiere einen Skill, wenn du bei der Nutzung etwas Besseres gelernt hast.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "kurzer Name, z.B. 'flugpreise-recherchieren'"},
+                    "description": {"type": "string", "description": "Ein-Zeilen-Beschreibung, wofür der Skill ist"},
+                    "content": {"type": "string", "description": "die vollständige Anleitung (Markdown, Schritte + Stolperfallen)"},
+                },
+                "required": ["name", "description", "content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "skill_read",
+            "description": "Lädt einen Skill (Namen stehen im Skill-Index im System-Prompt). Nutze das IMMER, bevor du eine Aufgabe angehst, für die ein passender Skill existiert.",
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "delegate",
             "description": "Delegiert eine abgegrenzte Teilaufgabe an einen Subagenten mit frischem, kleinem Kontext (token-effizient). Gut für Recherchen oder Analysen, deren Zwischenschritte du nicht brauchst — du bekommst nur das Endergebnis.",
             "parameters": {
@@ -97,7 +125,7 @@ TOOL_DEFS: list[dict[str, Any]] = [
     },
 ]
 
-SUBAGENT_TOOLS = {"shell", "web_search", "web_fetch", "memory_read"}
+SUBAGENT_TOOLS = {"shell", "web_search", "web_fetch", "memory_read", "skill_read"}
 
 
 def tool_defs(allowed: set[str] | None = None) -> list[dict[str, Any]]:
@@ -112,6 +140,10 @@ def execute_tool(name: str, args: dict[str, Any], agent) -> str:
             return agent.memory.save(args["name"], args["content"], args["hook"])
         if name == "memory_read":
             return agent.memory.read(args["name"])
+        if name == "skill_save":
+            return agent.skills.save(args["name"], args["description"], args["content"])
+        if name == "skill_read":
+            return agent.skills.read(args["name"])
         if name == "shell":
             cmd = args["command"]
             if DANGEROUS.search(cmd):
