@@ -31,6 +31,9 @@ class Config:
     max_tool_rounds: int = int(os.getenv("TALOS_MAX_TOOL_ROUNDS", "20"))
     # Verifier: Antworten nach Tool-Nutzung gegen die Tool-Ergebnisse prüfen
     verify: bool = os.getenv("TALOS_VERIFY", "1") != "0"
+    # Kontext-Kompaktierung: ab dieser Zeichenzahl wird alter Verlauf
+    # zusammengefasst (Token-Effizienz bei langen Sessions)
+    compact_chars: int = int(os.getenv("TALOS_COMPACT_CHARS", "60000"))
 
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)

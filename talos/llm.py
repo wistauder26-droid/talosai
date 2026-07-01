@@ -18,6 +18,9 @@ class LLM:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.client = OpenAI(base_url=cfg.base_url, api_key=cfg.api_key)
+        # kumulierter Verbrauch dieser Instanz (für Anzeige/Kostenkontrolle)
+        self.total_input_tokens = 0
+        self.total_output_tokens = 0
 
     def chat(
         self,
@@ -31,4 +34,7 @@ class LLM:
         if tools:
             kwargs["tools"] = tools
         resp = self.client.chat.completions.create(**kwargs)
+        if getattr(resp, "usage", None):
+            self.total_input_tokens += resp.usage.prompt_tokens or 0
+            self.total_output_tokens += resp.usage.completion_tokens or 0
         return resp.choices[0].message

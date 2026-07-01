@@ -84,9 +84,49 @@ class Agent:
         # Subagenten bestätigen nichts selbst — gefährliche Befehle werden abgelehnt
         return sub.run(task, verify_answer=False)
 
+    def _maybe_compact(self) -> None:
+        """Fasst alten Verlauf zusammen, wenn der Kontext zu groß wird.
+
+        Token-Effizienz: statt bei jeder Anfrage den kompletten Verlauf
+        mitzuschicken, wird der ältere Teil zu einer Zusammenfassung
+        verdichtet (mit dem günstigen Modell). Die letzten Turns bleiben
+        wörtlich erhalten.
+        """
+        size = sum(len(str(m.get("content") or "")) for m in self.messages)
+        if size < self.cfg.compact_chars:
+            return
+        # Schnittpunkt: letzte User-Textnachricht, damit keine
+        # Tool-Call-Paare zerrissen werden
+        cut = None
+        for i in range(len(self.messages) - 1, -1, -1):
+            m = self.messages[i]
+            if m.get("role") == "user" and isinstance(m.get("content"), str):
+                cut = i
+                break
+        if not cut:
+            return
+        old, keep = self.messages[:cut], self.messages[cut:]
+        transcript = "\n".join(
+            f"{m.get('role')}: {str(m.get('content') or '')[:1500]}" for m in old
+        )
+        summary = self.llm.chat(
+            [{
+                "role": "user",
+                "content": "Fasse diesen Gesprächsverlauf kompakt zusammen. Erhalte: "
+                "Fakten, getroffene Entscheidungen, wichtige Tool-Ergebnisse, offene "
+                "Punkte. Lass Smalltalk und Zwischenschritte weg.\n\n" + transcript,
+            }],
+            small=True,
+        ).content or ""
+        self.messages = [
+            {"role": "user", "content": f"[Zusammenfassung des bisherigen Verlaufs]\n{summary}"},
+            {"role": "assistant", "content": "Verstanden, ich habe den bisherigen Verlauf im Kopf."},
+        ] + keep
+
     def run(self, user_message: str, verify_answer: bool | None = None) -> str:
         """Verarbeitet eine Nutzernachricht bis zur finalen Antwort."""
         self.messages.append({"role": "user", "content": user_message})
+        self._maybe_compact()
         defs = tool_defs(self.allowed_tools)
         used_tools = False
         for _ in range(self.cfg.max_tool_rounds):
