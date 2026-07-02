@@ -61,6 +61,23 @@ class Agent:
         self.confirm = None
         # optionaler Modus-Zusatz zum System-Prompt (z.B. Coding-Modus)
         self.mode_prompt = ""
+        # MCP-Server nur für den Hauptagenten (Subagenten bleiben schlank)
+        self.mcp = None
+        if allowed_tools is None and getattr(self.cfg, "mcp_servers", None):
+            from .mcp_client import get_manager
+            self.mcp = get_manager(self.cfg.mcp_servers)
+        # mitgelieferte Skills beim ersten Start installieren
+        self._install_builtin_skills()
+
+    def _install_builtin_skills(self) -> None:
+        from pathlib import Path
+        builtin = Path(__file__).parent / "builtin_skills"
+        if not builtin.is_dir():
+            return
+        for src in builtin.glob("*.md"):
+            dst = self.skills.dir / src.name
+            if not dst.exists():
+                dst.write_text(src.read_text())
 
     def _system(self) -> dict:
         if self.system_prompt:
@@ -130,6 +147,8 @@ class Agent:
         self.messages.append({"role": "user", "content": user_message})
         self._maybe_compact()
         defs = tool_defs(self.allowed_tools)
+        if self.mcp:
+            defs = defs + self.mcp.tool_defs()
         used_tools = False
         for _ in range(self.cfg.max_tool_rounds):
             msg = self.llm.chat([self._system()] + self.messages, tools=defs)

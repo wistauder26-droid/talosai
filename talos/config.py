@@ -1,5 +1,11 @@
-"""Zentrale Konfiguration — alles über Umgebungsvariablen (.env)."""
+"""Zentrale Konfiguration.
 
+Basis über Umgebungsvariablen (.env); die Einstellungsseite des Dashboards
+schreibt data/settings.json, das die .env-Werte überschreibt (Provider-
+Profile, Voice, Verifier, MCP-Server).
+"""
+
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -42,3 +48,33 @@ class Config:
     def __post_init__(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "memory").mkdir(exist_ok=True)
+        self.mcp_servers: list[dict] = []
+        self._apply_settings_file()
+
+    @property
+    def settings_file(self) -> Path:
+        return self.data_dir / "settings.json"
+
+    def _apply_settings_file(self) -> None:
+        """data/settings.json (von der Einstellungsseite) überschreibt .env."""
+        if not self.settings_file.exists():
+            return
+        try:
+            s = json.loads(self.settings_file.read_text())
+        except json.JSONDecodeError:
+            return
+        active = s.get("active_provider")
+        for p in s.get("providers", []):
+            if p.get("name") == active:
+                self.base_url = p.get("base_url") or self.base_url
+                self.api_key = p.get("api_key") or self.api_key
+                self.model = p.get("model") or self.model
+                self.small_model = p.get("small_model", self.small_model)
+                break
+        if s.get("eleven_key"):
+            self.eleven_key = s["eleven_key"]
+        if s.get("eleven_voice"):
+            self.eleven_voice = s["eleven_voice"]
+        if "verify" in s:
+            self.verify = bool(s["verify"])
+        self.mcp_servers = s.get("mcp_servers", [])

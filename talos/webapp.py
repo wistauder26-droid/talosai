@@ -235,6 +235,48 @@ def tts(body: TTSIn):
     return Response(content=resp.content, media_type="audio/mpeg")
 
 
+DEFAULT_SETTINGS = {
+    "active_provider": "Anthropic",
+    "providers": [],
+    "eleven_key": "", "eleven_voice": "", "verify": True,
+    "mcp_servers": [],
+}
+
+
+@app.get("/api/settings")
+def get_settings():
+    s = dict(DEFAULT_SETTINGS)
+    if _cfg.settings_file.exists():
+        try:
+            s.update(json.loads(_cfg.settings_file.read_text()))
+        except json.JSONDecodeError:
+            pass
+    if not s["providers"]:
+        # Initialbestand aus der .env ableiten
+        s["providers"] = [{"name": "Anthropic", "base_url": _cfg.base_url,
+                           "api_key": _cfg.api_key, "model": _cfg.model,
+                           "small_model": _cfg.small_model}]
+        s["active_provider"] = "Anthropic"
+    if not s["eleven_key"]:
+        s["eleven_key"] = _cfg.eleven_key
+    if not s["eleven_voice"]:
+        s["eleven_voice"] = _cfg.eleven_voice
+    mcp_status = _agent.mcp.status() if _agent.mcp else None
+    return {**s, "mcp_status": mcp_status}
+
+
+@app.post("/api/settings")
+def save_settings(body: dict):
+    global _cfg, _agent
+    body.pop("mcp_status", None)
+    _cfg.settings_file.write_text(json.dumps(body, ensure_ascii=False, indent=2))
+    with _lock:
+        _cfg = Config()
+        _agent = _new_agent(getattr(_agent, "mode", "chat"))
+    status = _agent.mcp.status() if _agent.mcp else None
+    return {"ok": True, "model": _cfg.model, "mcp_status": status}
+
+
 @app.get("/api/state")
 def state():
     return {
@@ -353,6 +395,27 @@ PAGE = """<!doctype html>
   #kdetail pre{white-space:pre-wrap;word-break:break-word;font:11.5px/1.6 ui-monospace,Menlo,monospace}
   #khint{position:absolute;bottom:10px;left:14px;color:#4a5a78;font-size:11px}
   body.knowledge #chat,body.knowledge #suggestions,body.knowledge #form{display:none}
+
+  /* ===== Einstellungen ===== */
+  #setview{display:none;flex:1;overflow-y:auto;padding:10px 4px}
+  #setview.show{display:block}
+  body.settings #chat,body.settings #suggestions,body.settings #form{display:none}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
+        padding:18px;margin-bottom:14px}
+  .card h2{font-size:15px;margin-bottom:12px}
+  .card label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
+  .card input[type=text],.card input[type=password],.card select,.card textarea{
+        width:100%;padding:9px 12px;border-radius:9px;border:1px solid var(--border);
+        background:var(--bg);color:var(--text);font-size:13px;outline:none;
+        font-family:inherit}
+  .card textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;min-height:110px}
+  .row2{display:flex;gap:10px}.row2>div{flex:1}
+  .btnrow{display:flex;gap:10px;margin-top:14px;align-items:center}
+  .btn{background:var(--accent);color:#fff;border:none;border-radius:10px;
+        padding:9px 18px;font-size:13px;font-weight:500;cursor:pointer}
+  .btn.sec{background:var(--chip);color:var(--text)}
+  .hint{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.5}
+  #savemsg{font-size:12.5px;color:#30d158}
   @media(max-width:1100px){aside{display:none}}
   @media(max-width:800px){nav{display:none}}
 </style></head><body>
@@ -364,6 +427,7 @@ PAGE = """<!doctype html>
   <button id="mode-chat" onclick="setMode('chat')">💬 Chat</button>
   <button id="mode-coden" onclick="setMode('coden')">⌨️ Coden</button>
   <button id="mode-wissen" onclick="showKnowledge()">🕸 Wissen</button>
+  <button id="mode-settings" onclick="showSettings()">⚙️ Einstellungen</button>
   <div class="sect">Verlauf</div>
   <div id="history"></div>
 </nav>
@@ -377,6 +441,51 @@ PAGE = """<!doctype html>
     <canvas id="kcanvas"></canvas>
     <div id="kdetail"></div>
     <span id="khint">Ziehen: Knoten bewegen · Scrollen: Zoom · Klick: Details</span>
+  </div>
+  <div id="setview">
+    <div class="card">
+      <h2>🤖 LLM-Provider</h2>
+      <div class="row2">
+        <div><label>Aktiver Provider</label><select id="s-active"></select></div>
+        <div><label>Neu anlegen aus Vorlage</label><select id="s-preset">
+          <option value="">– Vorlage wählen –</option></select></div>
+      </div>
+      <div class="row2">
+        <div><label>Name</label><input type="text" id="s-name"></div>
+        <div><label>Base-URL (OpenAI-kompatibel)</label><input type="text" id="s-url"></div>
+      </div>
+      <label>API-Key</label><input type="password" id="s-key">
+      <div class="row2">
+        <div><label>Modell</label><input type="text" id="s-model"></div>
+        <div><label>Kleines Modell (Reflexion/Verifier)</label><input type="text" id="s-small"></div>
+      </div>
+      <div class="btnrow"><button class="btn sec" onclick="saveProvider()">Provider speichern</button>
+        <button class="btn sec" onclick="deleteProvider()">Löschen</button></div>
+      <div class="hint">Funktioniert mit jeder OpenAI-kompatiblen API: Anthropic, OpenAI,
+        OpenRouter, Groq, BytePlus ModelArk — oder 100&nbsp;% lokal mit Ollama/vLLM.</div>
+    </div>
+    <div class="card">
+      <h2>🗣 Sprachausgabe (ElevenLabs)</h2>
+      <div class="row2">
+        <div><label>API-Key</label><input type="password" id="s-elkey"></div>
+        <div><label>Voice-ID</label><input type="text" id="s-elvoice"></div>
+      </div>
+      <div class="hint">Leer lassen = Browser-Stimme. Key: elevenlabs.io → Profil → API Keys.</div>
+    </div>
+    <div class="card">
+      <h2>✅ Ehrlichkeits-Verifier</h2>
+      <label><input type="checkbox" id="s-verify"> Antworten nach Tool-Nutzung gegen
+        die Tool-Ergebnisse prüfen (empfohlen)</label>
+    </div>
+    <div class="card">
+      <h2>🔌 MCP-Server</h2>
+      <label>Konfiguration (JSON-Liste)</label>
+      <textarea id="s-mcp" placeholder='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/Users/du/Dokumente"]}]'></textarea>
+      <div class="hint" id="s-mcpstatus">Beispiele: Dateisystem (npx @modelcontextprotocol/server-filesystem),
+        Web (uvx mcp-server-fetch), oder jede URL eines Remote-MCP-Servers via {"name":"x","url":"https://…"}.</div>
+    </div>
+    <div class="btnrow"><button class="btn" onclick="saveSettings()">Alles speichern &amp; neu laden</button>
+      <span id="savemsg"></span></div>
   </div>
   <div id="chat"></div>
   <div id="suggestions">
@@ -584,6 +693,7 @@ kcv.addEventListener('wheel',e=>{e.preventDefault();
         mx=e.clientX-rect.left,my=e.clientY-rect.top;
   kcam.x=mx-(mx-kcam.x)*f;kcam.y=my-(my-kcam.y)*f;kcam.z*=f},{passive:false});
 async function showKnowledge(){
+  hideSettings();
   document.body.classList.add('knowledge');kview.classList.add('show');
   document.getElementById('modetitle').textContent='Wissen';
   document.getElementById('mode-wissen').classList.add('active');
@@ -597,6 +707,76 @@ function hideKnowledge(){document.body.classList.remove('knowledge');
   document.getElementById('mode-wissen').classList.remove('active')}
 addEventListener('resize',()=>{if(kactive)ksize()});
 
+// ===== Einstellungen =====
+const setview=document.getElementById('setview');
+const PRESETS={
+ 'Anthropic':{base_url:'https://api.anthropic.com/v1/',model:'claude-opus-4-8',small_model:'claude-haiku-4-5'},
+ 'OpenAI':{base_url:'https://api.openai.com/v1',model:'gpt-4o',small_model:'gpt-4o-mini'},
+ 'OpenRouter':{base_url:'https://openrouter.ai/api/v1',model:'anthropic/claude-sonnet-4.6',small_model:'meta-llama/llama-3.3-70b-instruct'},
+ 'Groq':{base_url:'https://api.groq.com/openai/v1',model:'llama-3.3-70b-versatile',small_model:'llama-3.1-8b-instant'},
+ 'BytePlus ModelArk':{base_url:'https://ark.ap-southeast.bytepluses.com/api/v3',model:'kimi-k2-250905',small_model:''},
+ 'Ollama (lokal)':{base_url:'http://localhost:11434/v1',model:'qwen3:14b',small_model:'qwen3:4b',api_key:'none'},
+ 'vLLM (lokal)':{base_url:'http://localhost:8000/v1',model:'',small_model:'',api_key:'none'}};
+let SETTINGS=null;
+const $=id=>document.getElementById(id);
+function fillProviderForm(name){
+  const p=SETTINGS.providers.find(x=>x.name===name);if(!p)return;
+  $('s-name').value=p.name;$('s-url').value=p.base_url||'';
+  $('s-key').value=p.api_key||'';$('s-model').value=p.model||'';
+  $('s-small').value=p.small_model||''}
+function renderProviders(){
+  const sel=$('s-active');sel.innerHTML='';
+  for(const p of SETTINGS.providers){const o=document.createElement('option');
+    o.value=p.name;o.textContent=p.name;sel.appendChild(o)}
+  sel.value=SETTINGS.active_provider;fillProviderForm(sel.value)}
+async function showSettings(){
+  hideKnowledge();document.body.classList.add('settings');setview.classList.add('show');
+  $('modetitle').textContent='Einstellungen';
+  $('mode-settings').classList.add('active');
+  $('mode-chat').classList.remove('active');$('mode-coden').classList.remove('active');
+  SETTINGS=await (await fetch('/api/settings')).json();
+  const ps=$('s-preset');ps.innerHTML='<option value="">– Vorlage wählen –</option>';
+  for(const k of Object.keys(PRESETS)){const o=document.createElement('option');
+    o.value=k;o.textContent=k;ps.appendChild(o)}
+  renderProviders();
+  $('s-elkey').value=SETTINGS.eleven_key||'';$('s-elvoice').value=SETTINGS.eleven_voice||'';
+  $('s-verify').checked=!!SETTINGS.verify;
+  $('s-mcp').value=SETTINGS.mcp_servers.length?JSON.stringify(SETTINGS.mcp_servers,null,1):'';
+  if(SETTINGS.mcp_status){const st=SETTINGS.mcp_status;
+    $('s-mcpstatus').textContent='Verbunden: '+st.servers.join(', ')+' ('+st.tools+' Tools)'+
+      (Object.keys(st.errors).length?' — Fehler: '+JSON.stringify(st.errors):'')}}
+function hideSettings(){document.body.classList.remove('settings');
+  setview.classList.remove('show');$('mode-settings').classList.remove('active')}
+$('s-active').addEventListener('change',e=>{SETTINGS.active_provider=e.target.value;
+  fillProviderForm(e.target.value)});
+$('s-preset').addEventListener('change',e=>{const p=PRESETS[e.target.value];if(!p)return;
+  $('s-name').value=e.target.value;$('s-url').value=p.base_url;
+  $('s-key').value=p.api_key||'';$('s-model').value=p.model;$('s-small').value=p.small_model||''});
+function saveProvider(){
+  const p={name:$('s-name').value.trim(),base_url:$('s-url').value.trim(),
+    api_key:$('s-key').value.trim(),model:$('s-model').value.trim(),
+    small_model:$('s-small').value.trim()};
+  if(!p.name||!p.base_url)return;
+  const i=SETTINGS.providers.findIndex(x=>x.name===p.name);
+  if(i>=0)SETTINGS.providers[i]=p;else SETTINGS.providers.push(p);
+  SETTINGS.active_provider=p.name;renderProviders();
+  $('savemsg').textContent='Provider gemerkt — unten "Alles speichern" klicken.'}
+function deleteProvider(){
+  SETTINGS.providers=SETTINGS.providers.filter(x=>x.name!==$('s-name').value.trim());
+  if(SETTINGS.providers.length)SETTINGS.active_provider=SETTINGS.providers[0].name;
+  renderProviders()}
+async function saveSettings(){
+  let mcp=[];const raw=$('s-mcp').value.trim();
+  if(raw){try{mcp=JSON.parse(raw)}catch(e){$('savemsg').textContent='MCP-JSON ungültig: '+e;return}}
+  SETTINGS.eleven_key=$('s-elkey').value.trim();
+  SETTINGS.eleven_voice=$('s-elvoice').value.trim();
+  SETTINGS.verify=$('s-verify').checked;SETTINGS.mcp_servers=mcp;
+  const r=await (await fetch('/api/settings',{method:'POST',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(SETTINGS)})).json();
+  $('savemsg').textContent='Gespeichert ✓ Modell: '+r.model+
+    (r.mcp_status?' · MCP: '+r.mcp_status.tools+' Tools':'');
+  refreshState()}
+
 // ===== Sessions / Verlauf / Modus =====
 async function refreshSessions(){const s=await (await fetch('/api/sessions')).json();
   const h=document.getElementById('history');h.innerHTML='';
@@ -608,12 +788,12 @@ function setModeUI(){document.getElementById('mode-chat').classList.toggle('acti
   document.getElementById('mode-coden').classList.toggle('active',mode==='coden');
   document.getElementById('modetitle').textContent=mode==='coden'?'Coden':'Chat';
   inp.placeholder=mode==='coden'?'Was soll ich bauen?':'Nachricht an Talos…'}
-async function setMode(m){hideKnowledge();mode=m;await newSession()}
-async function newSession(){hideKnowledge();await fetch('/api/session/new',{method:'POST',
+async function setMode(m){hideKnowledge();hideSettings();mode=m;await newSession()}
+async function newSession(){hideKnowledge();hideSettings();await fetch('/api/session/new',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
   chat.innerHTML='';sugg.style.display='flex';initGraph();setModeUI();
   refreshSessions();refreshState()}
-async function loadSession(id){hideKnowledge();const r=await (await fetch('/api/session/load',{method:'POST',
+async function loadSession(id){hideKnowledge();hideSettings();const r=await (await fetch('/api/session/load',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({id,mode})})).json();
   if(r.error)return;chat.innerHTML='';sugg.style.display='none';initGraph();
   for(const m of r.history){m.role==='user'?addUser(m.text):addBot(m.text)}

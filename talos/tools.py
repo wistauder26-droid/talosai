@@ -136,6 +136,10 @@ def tool_defs(allowed: set[str] | None = None) -> list[dict[str, Any]]:
 
 def execute_tool(name: str, args: dict[str, Any], agent) -> str:
     try:
+        if name.startswith("mcp__"):
+            if agent.mcp is None:
+                return "Kein MCP-Server verbunden."
+            return agent.mcp.call(name, args)
         if name == "memory_save":
             return agent.memory.save(args["name"], args["content"], args["hook"])
         if name == "memory_read":
