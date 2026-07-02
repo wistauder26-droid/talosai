@@ -1,13 +1,29 @@
 services:
-  talos:
+  # Web-Dashboard (Standard) — passwortgeschützt, für Cloud/VPS-Test.
+  talos-web:
     build: .
+    command: talos-web
     env_file: .env
+    environment:
+      TALOS_WEB_HOST: "0.0.0.0"
+      TALOS_WEB_PORT: "7777"
+    ports:
+      - "7777:7777"
     volumes:
       - ./data:/app/data
     restart: unless-stopped
 
+  # Telegram-Bot (optional) — mit `docker compose --profile telegram up -d`.
+  talos-telegram:
+    build: .
+    command: talos-telegram
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    profiles: ["telegram"]
+
   # Optional: lokales Modell via Ollama (auskommentieren zum Aktivieren).
-  # Dann in .env: TALOS_BASE_URL=http://ollama:11434/v1
   # ollama:
   #   image: ollama/ollama
   #   volumes:

@@ -8,14 +8,17 @@ Voice-Ein-/Ausgabe, Markdown, Dark Mode.
 
 from __future__ import annotations
 
+import base64
 import json
+import os
 import queue
+import secrets
 import threading
 import time
 import uuid
 
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from .agent import Agent
@@ -33,6 +36,32 @@ MODES = {
 }
 
 app = FastAPI(title="TalosAI")
+
+# Passwortschutz: wenn TALOS_WEB_PASSWORD gesetzt ist, verlangt das Dashboard
+# HTTP-Basic-Auth (beliebiger Nutzername, dieses Passwort). Pflicht, sobald der
+# Server öffentlich erreichbar ist — der Agent hat ein Shell-Tool.
+_WEB_PASSWORD = os.getenv("TALOS_WEB_PASSWORD", "")
+
+
+@app.middleware("http")
+async def _auth(request: Request, call_next):
+    if _WEB_PASSWORD:
+        header = request.headers.get("authorization", "")
+        ok = False
+        if header.startswith("Basic "):
+            try:
+                _, pw = base64.b64decode(header[6:]).decode().split(":", 1)
+                ok = secrets.compare_digest(pw, _WEB_PASSWORD)
+            except (ValueError, UnicodeDecodeError):
+                ok = False
+        if not ok:
+            return Response(
+                "Anmeldung erforderlich", status_code=401,
+                headers={"WWW-Authenticate": 'Basic realm="TalosAI"'},
+            )
+    return await call_next(request)
+
+
 _cfg = Config()
 _sessions_dir = _cfg.data_dir / "sessions"
 _sessions_dir.mkdir(exist_ok=True)
@@ -843,8 +872,16 @@ def index() -> HTMLResponse:
 def main() -> None:
     import uvicorn
 
-    print("TalosAI Dashboard: http://localhost:7777")
-    uvicorn.run(app, host="127.0.0.1", port=7777, log_level="warning")
+    host = os.getenv("TALOS_WEB_HOST", "127.0.0.1")
+    port = int(os.getenv("TALOS_WEB_PORT", "7777"))
+    if host != "127.0.0.1" and not _WEB_PASSWORD:
+        raise SystemExit(
+            "SICHERHEIT: Öffentlicher Host ohne TALOS_WEB_PASSWORD verweigert. "
+            "Setze TALOS_WEB_PASSWORD, bevor du das Dashboard nach außen öffnest."
+        )
+    where = f"http://{host}:{port}" if host != "127.0.0.1" else f"http://localhost:{port}"
+    print(f"TalosAI Dashboard: {where}" + ("  (passwortgeschützt)" if _WEB_PASSWORD else ""))
+    uvicorn.run(app, host=host, port=port, log_level="warning")
 
 
 if __name__ == "__main__":
