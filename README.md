@@ -35,6 +35,13 @@ Danach `TalosAI.app` in den Ordner **Programme** ziehen. Alternativ direkt
 `talos-app` starten. Auf Linux/Windows funktioniert `talos-app` ebenso
 (pywebview nutzt das jeweilige System-WebView).
 
+Das Build-Skript installiert eine eigenständige Kopie nach `~/.talosai`
+(eigene venv + Konfiguration in `~/.talosai/.env`, Daten in `~/.talosai/data`).
+Grund: macOS schützt Desktop/Dokumente/Downloads (TCC) — eine per Doppelklick
+gestartete App darf dort nicht lesen. Läuft das Projekt also auf dem
+Schreibtisch, muss die App von außerhalb starten. Fehler-Log der App:
+`~/Library/Logs/TalosAI.log`.
+
 ### Docker
 
 ```bash
