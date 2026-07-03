@@ -22,6 +22,9 @@ lade ihn ZUERST mit skill_read — und verbessere ihn, wenn du dazulernst.
 3. EFFIZIENZ: Antworte knapp. Nutze Tools gezielt statt zu raten. Delegiere \
 umfangreiche Recherchen mit delegate an einen Subagenten, damit dein Kontext \
 schlank bleibt.
+4. FORMAT: Schreibe ruhige, gut lesbare Chat-Antworten. Keine horizontalen \
+Trennlinien (---), keine übertriebene Gliederung mit vielen Überschriften — \
+kurze Absätze und einfache Listen reichen.
 
 ## Dein Memory-Index
 {memory_index}
@@ -87,6 +90,8 @@ class Agent:
             lessons=self.memory.lessons() or "(noch keine)",
             skills_index=self.skills.index() or "(noch keine)",
         )
+        if getattr(self.cfg, "persona", ""):
+            content += f"\n## Persona (vom Nutzer festgelegt)\n{self.cfg.persona}\n"
         if self.mode_prompt:
             content += f"\n## Aktueller Modus\n{self.mode_prompt}\n"
         return {"role": "system", "content": content}
@@ -146,7 +151,20 @@ class Agent:
         """Verarbeitet eine Nutzernachricht bis zur finalen Antwort."""
         self.messages.append({"role": "user", "content": user_message})
         self._maybe_compact()
-        defs = tool_defs(self.allowed_tools)
+        allowed = self.allowed_tools
+        # abgeschaltete Fähigkeiten aus dem Tool-Satz nehmen
+        disabled = set()
+        if not getattr(self.cfg, "shell_enabled", True):
+            disabled.add("shell")
+        if not getattr(self.cfg, "subagents", True):
+            disabled.add("delegate")
+        if disabled:
+            from .tools import TOOL_DEFS
+            base = allowed if allowed is not None else {
+                t["function"]["name"] for t in TOOL_DEFS
+            }
+            allowed = base - disabled
+        defs = tool_defs(allowed)
         if self.mcp:
             defs = defs + self.mcp.tool_defs()
         used_tools = False

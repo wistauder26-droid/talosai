@@ -1,9 +1,8 @@
 """Lokales Dashboard: Chat mit Talos + Live-Blick in Memory, Lektionen, Skills.
 
-Start: `talos-web`, dann http://localhost:7777
-Single-User, nur für localhost gedacht. Features: Verlauf (Sessions),
-Chat-/Coding-Modus, Live-Aktivitätsgraph, Token/Kosten-Anzeige,
-Voice-Ein-/Ausgabe, Markdown, Dark Mode.
+Start: `talos-web` (Browser) oder `talos-app` (natives Fenster).
+Single-User. Features: Verlauf (Sessions, löschbar), Chat-/Coding-Modus,
+Wissensgraph, Aktivitätsgraph, Token/Kosten-Anzeige, Voice, Einstellungen.
 """
 
 from __future__ import annotations
@@ -12,6 +11,7 @@ import base64
 import json
 import os
 import queue
+import re
 import secrets
 import threading
 import time
@@ -36,22 +36,27 @@ MODES = {
 }
 
 app = FastAPI(title="TalosAI")
+_cfg = Config()
+_sessions_dir = _cfg.data_dir / "sessions"
+_sessions_dir.mkdir(exist_ok=True)
+_lock = threading.Lock()  # ein Agent, eine Anfrage zur Zeit
 
-# Passwortschutz: wenn TALOS_WEB_PASSWORD gesetzt ist, verlangt das Dashboard
-# HTTP-Basic-Auth (beliebiger Nutzername, dieses Passwort). Pflicht, sobald der
-# Server öffentlich erreichbar ist — der Agent hat ein Shell-Tool.
-_WEB_PASSWORD = os.getenv("TALOS_WEB_PASSWORD", "")
+
+def _password() -> str:
+    # settings.json kann das Passwort überschreiben; .env ist der Fallback
+    return getattr(_cfg, "web_password", "") or os.getenv("TALOS_WEB_PASSWORD", "")
 
 
 @app.middleware("http")
 async def _auth(request: Request, call_next):
-    if _WEB_PASSWORD:
+    pw = _password()
+    if pw:
         header = request.headers.get("authorization", "")
         ok = False
         if header.startswith("Basic "):
             try:
-                _, pw = base64.b64decode(header[6:]).decode().split(":", 1)
-                ok = secrets.compare_digest(pw, _WEB_PASSWORD)
+                _, sent = base64.b64decode(header[6:]).decode().split(":", 1)
+                ok = secrets.compare_digest(sent, pw)
             except (ValueError, UnicodeDecodeError):
                 ok = False
         if not ok:
@@ -60,12 +65,6 @@ async def _auth(request: Request, call_next):
                 headers={"WWW-Authenticate": 'Basic realm="TalosAI"'},
             )
     return await call_next(request)
-
-
-_cfg = Config()
-_sessions_dir = _cfg.data_dir / "sessions"
-_sessions_dir.mkdir(exist_ok=True)
-_lock = threading.Lock()  # ein Agent, eine Anfrage zur Zeit
 
 
 def _new_agent(mode: str = "chat") -> Agent:
@@ -98,7 +97,7 @@ def _usage() -> dict:
         "output": _agent.llm.total_output_tokens,
         "cost": round(_agent.llm.total_cost_usd, 4),
         "context": _agent.llm.last_input_tokens,
-        "window": 200_000,
+        "window": getattr(_cfg, "context_window", 200_000),
     }
 
 
@@ -185,7 +184,6 @@ def session_load(body: SessionIn):
         _agent.session_id = d["id"]
         _agent.title = d.get("title", "")
         _agent.messages = d["messages"]
-    # nur User/Assistent-Textnachrichten fürs UI
     history = [
         {"role": m["role"], "text": m["content"]}
         for m in _agent.messages
@@ -195,11 +193,24 @@ def session_load(body: SessionIn):
     return {"id": d["id"], "history": history}
 
 
+@app.delete("/api/session/{session_id}")
+def session_delete(session_id: str):
+    """Einzelnen Chat aus dem Verlauf löschen."""
+    global _agent
+    if not re.fullmatch(r"[0-9a-f]{12}", session_id):
+        return JSONResponse({"error": "ungültige ID"}, status_code=400)
+    path = _sessions_dir / f"{session_id}.json"
+    if path.exists():
+        path.unlink()
+    with _lock:
+        if _agent.session_id == session_id:
+            _agent = _new_agent(getattr(_agent, "mode", "chat"))
+    return {"ok": True, "current": _agent.session_id}
+
+
 @app.get("/api/graph")
 def graph():
     """Wissens-Graph im Obsidian-Stil: Memory, Skills, Lektionen + Links."""
-    import re as _re
-
     nodes = [
         {"id": "talos", "label": "Talos", "type": "hub", "content": ""},
         {"id": "hub-mem", "label": "Gedächtnis", "type": "hub", "content": ""},
@@ -210,17 +221,16 @@ def graph():
              {"a": "talos", "b": "hub-lesson"}]
     mem_ids = set()
     for p in sorted(_agent.memory.dir.glob("*.md")):
-        if p.name == "MEMORY.md" or p.name == "lessons.md":
+        if p.name in ("MEMORY.md", "lessons.md"):
             continue
         nid = f"mem-{p.stem}"
         mem_ids.add(p.stem)
         nodes.append({"id": nid, "label": p.stem, "type": "memory",
                       "content": p.read_text()[:2000]})
         links.append({"a": "hub-mem", "b": nid})
-    # [[wiki-links]] zwischen Memory-Einträgen
     for p in _agent.memory.dir.glob("*.md"):
         if p.stem in mem_ids:
-            for target in _re.findall(r"\[\[([\w-]+)\]\]", p.read_text()):
+            for target in re.findall(r"\[\[([\w-]+)\]\]", p.read_text()):
                 if target in mem_ids and target != p.stem:
                     links.append({"a": f"mem-{p.stem}", "b": f"mem-{target}"})
     for p in sorted(_agent.skills.dir.glob("*.md")):
@@ -247,7 +257,6 @@ def tts(body: TTSIn):
     if not _cfg.eleven_key:
         return {"error": "kein ElevenLabs-Key konfiguriert"}
     import httpx
-    from fastapi.responses import Response
 
     resp = httpx.post(
         f"https://api.elevenlabs.io/v1/text-to-speech/{_cfg.eleven_voice}",
@@ -269,6 +278,13 @@ DEFAULT_SETTINGS = {
     "providers": [],
     "eleven_key": "", "eleven_voice": "", "verify": True,
     "mcp_servers": [],
+    "persona": "",
+    "max_tool_rounds": 20, "compact_chars": 60000, "context_window": 200000,
+    "subagents": True, "shell_enabled": True,
+    "web_password": "",
+    "telegram_token": "", "telegram_allowed": "",
+    "tts_default": False, "tts_rate": 1.05,
+    "show_tools": True, "show_graph": True,
 }
 
 
@@ -281,7 +297,6 @@ def get_settings():
         except json.JSONDecodeError:
             pass
     if not s["providers"]:
-        # Initialbestand aus der .env ableiten
         s["providers"] = [{"name": "Anthropic", "base_url": _cfg.base_url,
                            "api_key": _cfg.api_key, "model": _cfg.model,
                            "small_model": _cfg.small_model}]
@@ -315,6 +330,12 @@ def state():
         "model": _agent.cfg.model,
         "mode": getattr(_agent, "mode", "chat"),
         "usage": _usage(),
+        "ui": {
+            "tts_default": getattr(_cfg, "tts_default", False),
+            "tts_rate": getattr(_cfg, "tts_rate", 1.05),
+            "show_tools": getattr(_cfg, "show_tools", True),
+            "show_graph": getattr(_cfg, "show_graph", True),
+        },
     }
 
 
@@ -324,156 +345,211 @@ PAGE = """<!doctype html>
 <title>TalosAI</title>
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 <style>
-  :root{--bg:#f5f5f7;--card:#fff;--text:#1d1d1f;--muted:#86868b;--accent:#0071e3;
-        --border:#e5e5ea;--chip:#f0f0f2;--nav:#ececf0;--radius:16px}
-  @media(prefers-color-scheme:dark){:root{--bg:#000;--card:#1c1c1e;--text:#f5f5f7;
-        --muted:#98989d;--accent:#0a84ff;--border:#2c2c2e;--chip:#2c2c2e;--nav:#141416}}
+  :root{--bg:#f6f7fa;--panel:#eef0f5;--card:#ffffff;--text:#1a2333;--muted:#68738a;
+        --accent:#2b6fd4;--accent-soft:rgba(43,111,212,.09);--border:#e2e6ef;
+        --shadow:0 1px 3px rgba(20,32,60,.07);--radius:14px}
+  @media(prefers-color-scheme:dark){:root{--bg:#0d1526;--panel:#0a111f;--card:#141f36;
+        --text:#e8edf7;--muted:#8fa0bb;--accent:#5aa2f7;--accent-soft:rgba(90,162,247,.12);
+        --border:#233150;--shadow:0 1px 3px rgba(0,0,0,.35)}}
   *{box-sizing:border-box;margin:0}
   body{font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text',Helvetica,Arial,sans-serif;
-       background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden}
+       background:var(--bg);color:var(--text);height:100vh;display:flex;overflow:hidden;
+       font-size:15px;-webkit-font-smoothing:antialiased}
+  svg.ic{width:16px;height:16px;stroke:currentColor;stroke-width:1.7;fill:none;
+       stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}
 
   /* ===== linke Navigation ===== */
-  nav{width:230px;background:var(--nav);border-right:1px solid var(--border);padding:16px 12px;
-      display:flex;flex-direction:column;gap:4px;flex-shrink:0}
-  nav .logo{font-size:17px;font-weight:700;letter-spacing:-.02em;padding:4px 10px 14px}
-  nav button{display:flex;align-items:center;gap:9px;width:100%;text-align:left;background:none;
-      border:none;color:var(--text);padding:9px 10px;border-radius:10px;font-size:14px;cursor:pointer}
-  nav button:hover{background:var(--chip)}
+  nav{width:232px;background:var(--panel);border-right:1px solid var(--border);
+      padding:18px 12px 14px;display:flex;flex-direction:column;gap:3px;flex-shrink:0}
+  nav .logo{display:flex;align-items:baseline;gap:2px;padding:0 10px 16px}
+  nav .logo b{font-family:ui-serif,Georgia,serif;font-size:19px;font-weight:600;
+      letter-spacing:.01em}
+  nav .logo span{color:var(--muted);font-size:11px;margin-left:8px}
+  nav button{display:flex;align-items:center;gap:10px;width:100%;text-align:left;
+      background:none;border:none;color:var(--text);padding:8px 10px;border-radius:9px;
+      font-size:13.5px;cursor:pointer;font-family:inherit}
+  nav button:hover{background:var(--accent-soft)}
   nav button.active{background:var(--accent);color:#fff}
-  nav .sect{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;
-      letter-spacing:.05em;padding:16px 10px 6px}
-  #history{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:2px}
-  #history button{font-size:13px;color:var(--muted);white-space:nowrap;overflow:hidden;
-      text-overflow:ellipsis;display:block}
-  #history button.active{background:var(--chip);color:var(--text)}
+  nav .sect{font-size:10.5px;font-weight:600;color:var(--muted);text-transform:uppercase;
+      letter-spacing:.08em;padding:18px 10px 6px}
+  #history{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:1px}
+  #history .hrow{display:flex;align-items:center;border-radius:9px}
+  #history .hrow:hover{background:var(--accent-soft)}
+  #history .hrow.active{background:var(--card);box-shadow:var(--shadow)}
+  #history .hrow button.title{flex:1;font-size:13px;color:var(--muted);white-space:nowrap;
+      overflow:hidden;text-overflow:ellipsis;display:block;padding:7px 4px 7px 10px}
+  #history .hrow.active button.title{color:var(--text)}
+  #history .hrow button.title:hover{background:none}
+  #history .del{opacity:0;width:26px;height:26px;padding:5px;border-radius:7px;
+      color:var(--muted)}
+  #history .hrow:hover .del{opacity:1}
+  #history .del:hover{color:#e5484d;background:none}
 
   /* ===== Mitte: Chat ===== */
-  main{flex:1;display:flex;flex-direction:column;max-width:800px;margin:0 auto;
-       padding:18px 24px;height:100vh;min-width:0}
-  header{display:flex;align-items:center;gap:10px;padding-bottom:6px}
-  header h1{font-size:18px;font-weight:600}
-  .badge{font-size:11px;color:var(--muted);background:var(--chip);padding:3px 10px;border-radius:10px}
-  #chat{flex:1;overflow-y:auto;padding:12px 4px;display:flex;flex-direction:column;gap:10px}
-  .msg{max-width:86%;padding:11px 15px;border-radius:var(--radius);line-height:1.55;
-       font-size:15px;word-break:break-word;position:relative}
-  .msg p{margin:0 0 8px}.msg p:last-child{margin:0}
-  .msg pre{background:rgba(128,128,128,.12);padding:10px;border-radius:8px;overflow-x:auto;
-       font-size:13px;margin:8px 0}
-  .msg code{font-family:ui-monospace,Menlo,monospace;font-size:13px}
-  .msg ul,.msg ol{padding-left:20px;margin:6px 0}
-  .user{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:5px;
-        white-space:pre-wrap}
-  .bot{align-self:flex-start;background:var(--card);border-bottom-left-radius:5px;
-       box-shadow:0 1px 2px rgba(0,0,0,.08)}
-  .speakbtn{position:absolute;bottom:-22px;left:6px;background:none;border:none;cursor:pointer;
-       font-size:13px;color:var(--muted);padding:2px}
-  .tool{align-self:flex-start;font-size:12px;color:var(--muted);padding:2px 10px;
-        background:var(--chip);border-radius:10px;max-width:86%;overflow:hidden;
-        text-overflow:ellipsis;white-space:nowrap;animation:pop .2s ease}
-  @keyframes pop{from{opacity:0;transform:translateY(4px)}to{opacity:1}}
-  .typing{align-self:flex-start;color:var(--muted);font-size:14px;padding:4px 8px}
-  .typing::after{content:'●●●';letter-spacing:3px;animation:blink 1.2s infinite}
-  @keyframes blink{50%{opacity:.3}}
+  main{flex:1;display:flex;flex-direction:column;max-width:840px;margin:0 auto;
+       padding:16px 28px;height:100vh;min-width:0}
+  header{display:flex;align-items:center;gap:10px;padding-bottom:4px}
+  header h1{font-size:16px;font-weight:600;letter-spacing:-.01em}
+  .badge{font-size:11px;color:var(--muted);background:var(--panel);padding:3px 10px;
+      border-radius:8px;border:1px solid var(--border)}
+  #chat{flex:1;overflow-y:auto;padding:16px 2px;display:flex;flex-direction:column;gap:18px}
+
+  .turn-user{align-self:flex-end;max-width:78%;background:var(--accent-soft);
+      border:1px solid var(--border);padding:10px 15px;border-radius:16px;
+      border-bottom-right-radius:6px;line-height:1.55;white-space:pre-wrap;
+      word-break:break-word}
+  .turn-bot{display:flex;gap:12px;max-width:100%}
+  .turn-bot .mark{width:26px;height:26px;border-radius:8px;background:var(--card);
+      border:1px solid var(--border);display:flex;align-items:center;justify-content:center;
+      font-family:ui-serif,Georgia,serif;font-size:13px;flex-shrink:0;margin-top:2px;
+      color:var(--accent);box-shadow:var(--shadow)}
+  .turn-bot .body{flex:1;min-width:0;line-height:1.62;padding-top:3px}
+  .turn-bot .body p{margin:0 0 10px}.turn-bot .body p:last-child{margin:0}
+  .turn-bot .body hr{display:none}
+  .turn-bot .body pre{background:var(--panel);border:1px solid var(--border);
+      padding:12px;border-radius:10px;overflow-x:auto;font-size:13px;margin:10px 0}
+  .turn-bot .body code{font-family:ui-monospace,Menlo,monospace;font-size:13px}
+  .turn-bot .body :not(pre)>code{background:var(--panel);padding:1px 5px;border-radius:5px}
+  .turn-bot .body ul,.turn-bot .body ol{padding-left:22px;margin:8px 0}
+  .turn-bot .body li{margin:3px 0}
+  .turn-bot .body h1,.turn-bot .body h2,.turn-bot .body h3{font-size:15.5px;margin:14px 0 6px}
+  .turn-bot .actions{display:flex;gap:10px;margin-top:8px}
+  .turn-bot .actions button{background:none;border:none;color:var(--muted);cursor:pointer;
+      padding:2px;border-radius:6px;display:flex;align-items:center;gap:5px;font-size:12px}
+  .turn-bot .actions button:hover{color:var(--text)}
+
+  /* Arbeits-Status + eingeklappte Schritte */
+  .working{display:flex;align-items:center;gap:10px;color:var(--muted);font-size:13.5px;
+      padding-left:38px}
+  .working .pulse{width:8px;height:8px;border-radius:50%;background:var(--accent);
+      animation:pulse 1.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.35;transform:scale(.85)}50%{opacity:1;transform:scale(1)}}
+  details.steps{margin:0 0 6px 38px;font-size:12.5px;color:var(--muted)}
+  details.steps summary{cursor:pointer;list-style:none;display:inline-flex;gap:6px;
+      align-items:center;padding:3px 10px;border:1px solid var(--border);border-radius:8px;
+      background:var(--panel)}
+  details.steps summary::after{content:'›';transform:rotate(90deg);transition:transform .15s;
+      display:inline-block}
+  details.steps[open] summary::after{transform:rotate(-90deg)}
+  details.steps .step{padding:4px 2px 0 10px;font-family:ui-monospace,Menlo,monospace;
+      font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
   #suggestions{display:flex;gap:8px;flex-wrap:wrap;padding:8px 0}
-  #suggestions button{background:var(--chip);border:none;color:var(--text);padding:8px 14px;
-        border-radius:16px;font-size:13px;cursor:pointer}
-  form{display:flex;gap:8px;padding-top:10px;align-items:center}
-  input[type=text]{flex:1;padding:13px 18px;border-radius:24px;border:1px solid var(--border);
-        font-size:15px;background:var(--card);color:var(--text);outline:none;min-width:0}
-  input[type=text]:focus{border-color:var(--accent)}
-  .iconbtn{width:44px;height:44px;border:none;border-radius:50%;background:var(--chip);
-        color:var(--text);font-size:18px;cursor:pointer;flex-shrink:0}
-  .iconbtn.active{background:#ff3b30;color:#fff}
-  .iconbtn.on{background:var(--accent);color:#fff}
-  #send{width:auto;padding:0 20px;height:44px;border-radius:24px;background:var(--accent);
-        color:#fff;font-size:15px;font-weight:500}
-  #send:disabled{opacity:.4}
+  #suggestions button{background:none;border:1px solid var(--border);color:var(--muted);
+      padding:7px 14px;border-radius:10px;font-size:12.5px;cursor:pointer;font-family:inherit}
+  #suggestions button:hover{color:var(--text);border-color:var(--muted)}
 
-  /* ===== rechte Seite: Graph + Wissen + Verbrauch ===== */
-  aside{width:340px;background:var(--card);border-left:1px solid var(--border);
+  form{display:flex;gap:8px;padding:12px;align-items:flex-end;background:var(--card);
+      border:1px solid var(--border);border-radius:18px;box-shadow:var(--shadow);
+      margin-bottom:6px}
+  input[type=text].chatinp{flex:1;padding:9px 8px;border:none;font-size:15px;
+      background:none;color:var(--text);outline:none;min-width:0;font-family:inherit}
+  .iconbtn{width:36px;height:36px;border:none;border-radius:10px;background:none;
+      color:var(--muted);cursor:pointer;flex-shrink:0;display:flex;align-items:center;
+      justify-content:center}
+  .iconbtn:hover{background:var(--accent-soft);color:var(--text)}
+  .iconbtn.rec{background:#e5484d;color:#fff}
+  .iconbtn.on{color:var(--accent);background:var(--accent-soft)}
+  #send{background:var(--accent);color:#fff;border-radius:10px}
+  #send:hover{background:var(--accent)}
+  #send:disabled{opacity:.35}
+
+  /* ===== rechte Seite ===== */
+  aside{width:330px;background:var(--card);border-left:1px solid var(--border);
         overflow-y:auto;display:flex;flex-direction:column;flex-shrink:0}
-  #graphwrap{position:relative;background:#0d1526;height:240px;flex-shrink:0}
+  #graphwrap{position:relative;background:#0d1526;height:225px;flex-shrink:0}
   #graph{width:100%;height:100%;display:block}
-  #graphlabel{position:absolute;bottom:8px;left:12px;color:#4a5a78;font-size:11px}
-  .asidebody{padding:16px 20px;display:flex;flex-direction:column;gap:6px}
-  details{border-bottom:1px solid var(--border);padding:9px 0}
-  summary{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;
-        letter-spacing:.05em;cursor:pointer;list-style:none;display:flex;gap:8px}
-  summary::before{content:'›';transition:transform .15s}
-  details[open] summary::before{transform:rotate(90deg)}
-  details pre{font:12px/1.7 ui-monospace,Menlo,monospace;white-space:pre-wrap;
+  #graphlabel{position:absolute;bottom:8px;left:12px;color:#4a5a78;font-size:10.5px;
+      letter-spacing:.06em;text-transform:uppercase}
+  .asidebody{padding:14px 20px;display:flex;flex-direction:column;gap:4px}
+  aside details{border-bottom:1px solid var(--border);padding:9px 0}
+  aside summary{font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;
+        letter-spacing:.08em;cursor:pointer;list-style:none;display:flex;gap:8px}
+  aside summary::before{content:'›';transition:transform .15s}
+  aside details[open] summary::before{transform:rotate(90deg)}
+  aside details pre{font:11.5px/1.7 ui-monospace,Menlo,monospace;white-space:pre-wrap;
         word-break:break-word;padding-top:8px;color:var(--text)}
-
-  /* Verbrauch im Claude-Code-Stil */
-  #usagebox{background:var(--chip);border-radius:12px;padding:12px 14px;margin-top:10px;
-        font:12px/1.8 ui-monospace,Menlo,monospace}
+  #usagebox{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+        padding:12px 14px;margin-top:12px;font:12px/1.9 ui-monospace,Menlo,monospace}
   #usagebox .row{display:flex;justify-content:space-between}
   #usagebox .row span:last-child{font-weight:600}
-  #ctxbar{height:6px;background:rgba(128,128,128,.25);border-radius:3px;margin-top:6px;overflow:hidden}
-  #ctxfill{height:100%;width:0%;background:#30d158;border-radius:3px;transition:width .4s}
-  #ctxfill.warn{background:#ffd60a}#ctxfill.crit{background:#ff453a}
-  /* ===== Obsidian-Wissensgraph (Vollbild-View) ===== */
-  #knowview{display:none;flex:1;position:relative;background:#0d1526;border-radius:var(--radius);
-        overflow:hidden;margin:8px 0}
+  #ctxbar{height:5px;background:var(--border);border-radius:3px;margin-top:6px;overflow:hidden}
+  #ctxfill{height:100%;width:0%;background:#31a04f;border-radius:3px;transition:width .4s}
+  #ctxfill.warn{background:#d9a514}#ctxfill.crit{background:#e5484d}
+
+  /* ===== Wissensgraph ===== */
+  #knowview{display:none;flex:1;position:relative;background:#0d1526;
+        border-radius:var(--radius);overflow:hidden;margin:8px 0}
   #knowview.show{display:block}
   #kcanvas{width:100%;height:100%;display:block;cursor:grab}
   #kdetail{position:absolute;top:14px;right:14px;width:280px;max-height:70%;overflow-y:auto;
         background:rgba(20,28,48,.92);border:1px solid #2a3a5c;border-radius:12px;padding:14px;
         color:#dce4f5;font-size:12.5px;line-height:1.6;display:none;backdrop-filter:blur(8px)}
   #kdetail h3{font-size:13px;margin-bottom:6px;color:#fff}
-  #kdetail pre{white-space:pre-wrap;word-break:break-word;font:11.5px/1.6 ui-monospace,Menlo,monospace}
+  #kdetail pre{white-space:pre-wrap;word-break:break-word;
+        font:11.5px/1.6 ui-monospace,Menlo,monospace}
   #khint{position:absolute;bottom:10px;left:14px;color:#4a5a78;font-size:11px}
-  body.knowledge #chat,body.knowledge #suggestions,body.knowledge #form{display:none}
+  body.knowledge #chat,body.knowledge #suggestions,body.knowledge form{display:none}
 
   /* ===== Einstellungen ===== */
   #setview{display:none;flex:1;overflow-y:auto;padding:10px 4px}
   #setview.show{display:block}
-  body.settings #chat,body.settings #suggestions,body.settings #form{display:none}
-  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;
-        padding:18px;margin-bottom:14px}
-  .card h2{font-size:15px;margin-bottom:12px}
-  .card label{display:block;font-size:12px;color:var(--muted);margin:10px 0 4px}
-  .card input[type=text],.card input[type=password],.card select,.card textarea{
+  body.settings #chat,body.settings #suggestions,body.settings form{display:none}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
+        padding:20px;margin-bottom:14px;box-shadow:var(--shadow)}
+  .card h2{font-size:14px;margin-bottom:4px}
+  .card .desc{font-size:12px;color:var(--muted);margin-bottom:10px;line-height:1.5}
+  .card label{display:block;font-size:11.5px;color:var(--muted);margin:12px 0 4px;
+        font-weight:500}
+  .card input[type=text],.card input[type=password],.card input[type=number],
+  .card select,.card textarea{
         width:100%;padding:9px 12px;border-radius:9px;border:1px solid var(--border);
         background:var(--bg);color:var(--text);font-size:13px;outline:none;
         font-family:inherit}
-  .card textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;min-height:110px}
-  .row2{display:flex;gap:10px}.row2>div{flex:1}
-  .btnrow{display:flex;gap:10px;margin-top:14px;align-items:center}
+  .card input:focus,.card textarea:focus{border-color:var(--accent)}
+  .card textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;min-height:100px}
+  .card textarea.plain{font-family:inherit;font-size:13px;min-height:70px}
+  .row2{display:flex;gap:12px}.row2>div{flex:1}
+  .row3{display:flex;gap:12px}.row3>div{flex:1}
+  .checkrow{display:flex;align-items:center;gap:8px;font-size:13px;margin-top:10px}
+  .checkrow input{accent-color:var(--accent)}
+  .btnrow{display:flex;gap:10px;margin-top:16px;align-items:center}
   .btn{background:var(--accent);color:#fff;border:none;border-radius:10px;
-        padding:9px 18px;font-size:13px;font-weight:500;cursor:pointer}
-  .btn.sec{background:var(--chip);color:var(--text)}
-  .hint{font-size:11.5px;color:var(--muted);margin-top:6px;line-height:1.5}
-  #savemsg{font-size:12.5px;color:#30d158}
+        padding:9px 18px;font-size:13px;font-weight:500;cursor:pointer;font-family:inherit}
+  .btn.sec{background:var(--panel);color:var(--text);border:1px solid var(--border)}
+  .hint{font-size:11.5px;color:var(--muted);margin-top:8px;line-height:1.5}
+  #savemsg{font-size:12.5px;color:#31a04f}
+
   @media(max-width:1100px){aside{display:none}}
   @media(max-width:800px){nav{display:none}}
 </style></head><body>
 
 <nav>
-  <div class="logo">◈ TalosAI</div>
-  <button onclick="newSession()">＋ Neuer Chat</button>
-  <div class="sect">Modus</div>
-  <button id="mode-chat" onclick="setMode('chat')">💬 Chat</button>
-  <button id="mode-coden" onclick="setMode('coden')">⌨️ Coden</button>
-  <button id="mode-wissen" onclick="showKnowledge()">🕸 Wissen</button>
-  <button id="mode-settings" onclick="showSettings()">⚙️ Einstellungen</button>
+  <div class="logo"><b>TalosAI</b><span id="model"></span></div>
+  <button onclick="newSession()"><svg class="ic" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>Neuer Chat</button>
+  <div class="sect">Bereiche</div>
+  <button id="mode-chat" onclick="setMode('chat')"><svg class="ic" viewBox="0 0 24 24"><path d="M21 12a8 8 0 0 1-8 8H4l2-3a8 8 0 1 1 15-5z"/></svg>Chat</button>
+  <button id="mode-coden" onclick="setMode('coden')"><svg class="ic" viewBox="0 0 24 24"><path d="m8 8-4 4 4 4M16 8l4 4-4 4"/></svg>Coden</button>
+  <button id="mode-wissen" onclick="showKnowledge()"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="5" r="2"/><circle cx="5" cy="17" r="2"/><circle cx="19" cy="17" r="2"/><path d="M11 7 6 15m7-8 5 8M7 17h10"/></svg>Wissen</button>
   <div class="sect">Verlauf</div>
   <div id="history"></div>
+  <button id="mode-settings" onclick="showSettings()" style="margin-top:8px"><svg class="ic" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7 7 0 0 0-2-1.2L14.2 3h-4l-.4 2.5a7 7 0 0 0-2 1.2l-2.3-1-2 3.4 2 1.5a7 7 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7 7 0 0 0 2 1.2l.4 2.5h4l.4-2.5a7 7 0 0 0 2-1.2l2.3 1 2-3.4-2-1.5c.06-.4.1-.8.1-1.2z"/></svg>Einstellungen</button>
 </nav>
 
 <main>
-  <header>
-    <h1 id="modetitle">Chat</h1>
-    <span class="badge" id="model"></span>
-  </header>
+  <header><h1 id="modetitle">Chat</h1></header>
+
   <div id="knowview">
     <canvas id="kcanvas"></canvas>
     <div id="kdetail"></div>
     <span id="khint">Ziehen: Knoten bewegen · Scrollen: Zoom · Klick: Details</span>
   </div>
+
   <div id="setview">
     <div class="card">
-      <h2>🤖 LLM-Provider</h2>
+      <h2>LLM-Provider</h2>
+      <div class="desc">Funktioniert mit jeder OpenAI-kompatiblen API — auch 100 % lokal
+        mit Ollama oder vLLM.</div>
       <div class="row2">
         <div><label>Aktiver Provider</label><select id="s-active"></select></div>
         <div><label>Neu anlegen aus Vorlage</label><select id="s-preset">
@@ -481,7 +557,7 @@ PAGE = """<!doctype html>
       </div>
       <div class="row2">
         <div><label>Name</label><input type="text" id="s-name"></div>
-        <div><label>Base-URL (OpenAI-kompatibel)</label><input type="text" id="s-url"></div>
+        <div><label>Base-URL</label><input type="text" id="s-url"></div>
       </div>
       <label>API-Key</label><input type="password" id="s-key">
       <div class="row2">
@@ -490,32 +566,79 @@ PAGE = """<!doctype html>
       </div>
       <div class="btnrow"><button class="btn sec" onclick="saveProvider()">Provider speichern</button>
         <button class="btn sec" onclick="deleteProvider()">Löschen</button></div>
-      <div class="hint">Funktioniert mit jeder OpenAI-kompatiblen API: Anthropic, OpenAI,
-        OpenRouter, Groq, BytePlus ModelArk — oder 100&nbsp;% lokal mit Ollama/vLLM.</div>
     </div>
+
     <div class="card">
-      <h2>🗣 Sprachausgabe (ElevenLabs)</h2>
-      <div class="row2">
-        <div><label>API-Key</label><input type="password" id="s-elkey"></div>
-        <div><label>Voice-ID</label><input type="text" id="s-elvoice"></div>
+      <h2>Persona</h2>
+      <div class="desc">Eigene Anweisungen, die Talos in jeder Unterhaltung befolgt —
+        z. B. Name, Tonfall, Antwortsprache oder Fachgebiet.</div>
+      <textarea class="plain" id="s-persona" placeholder="z. B.: Sprich mich mit Anton an. Antworte immer auf Deutsch, locker aber präzise."></textarea>
+    </div>
+
+    <div class="card">
+      <h2>Agent-Verhalten</h2>
+      <div class="row3">
+        <div><label>Max. Tool-Runden pro Nachricht</label><input type="number" id="s-rounds" min="5" max="100"></div>
+        <div><label>Kompaktierung ab (Zeichen)</label><input type="number" id="s-compact" min="10000" step="5000"></div>
+        <div><label>Kontextfenster (Tokens, für %-Anzeige)</label><input type="number" id="s-window" min="8000" step="1000"></div>
       </div>
-      <div class="hint">Leer lassen = Browser-Stimme. Key: elevenlabs.io → Profil → API Keys.</div>
+      <div class="checkrow"><input type="checkbox" id="s-verify"><label for="s-verify" style="margin:0">Ehrlichkeits-Verifier: Antworten gegen Tool-Ergebnisse prüfen (empfohlen)</label></div>
+      <div class="checkrow"><input type="checkbox" id="s-subagents"><label for="s-subagents" style="margin:0">Subagenten erlauben (delegate-Tool)</label></div>
+      <div class="checkrow"><input type="checkbox" id="s-shell"><label for="s-shell" style="margin:0">Shell-Tool erlauben (Befehle auf diesem Rechner ausführen)</label></div>
     </div>
+
     <div class="card">
-      <h2>✅ Ehrlichkeits-Verifier</h2>
-      <label><input type="checkbox" id="s-verify"> Antworten nach Tool-Nutzung gegen
-        die Tool-Ergebnisse prüfen (empfohlen)</label>
+      <h2>Sprachausgabe</h2>
+      <div class="desc">Mit ElevenLabs-Key spricht Talos mit natürlicher Stimme,
+        sonst mit der Browser-Stimme.</div>
+      <div class="row3">
+        <div><label>ElevenLabs API-Key</label><input type="password" id="s-elkey"></div>
+        <div><label>Voice-ID</label><input type="text" id="s-elvoice"></div>
+        <div><label>Sprechtempo (0.5–2)</label><input type="number" id="s-elrate" min="0.5" max="2" step="0.05"></div>
+      </div>
+      <div class="checkrow"><input type="checkbox" id="s-ttsdefault"><label for="s-ttsdefault" style="margin:0">Antworten standardmäßig vorlesen</label></div>
     </div>
+
     <div class="card">
-      <h2>🔌 MCP-Server</h2>
+      <h2>Telegram</h2>
+      <div class="desc">Token von @BotFather, deine User-ID von @userinfobot.
+        Danach startet der Bot mit <code>talos-telegram</code>.</div>
+      <div class="row2">
+        <div><label>Bot-Token</label><input type="password" id="s-tgtoken"></div>
+        <div><label>Erlaubte User-IDs (kommagetrennt)</label><input type="text" id="s-tgallowed"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Sicherheit</h2>
+      <div class="row2">
+        <div><label>Dashboard-Passwort (leer = kein Schutz, nur lokal!)</label>
+          <input type="password" id="s-webpw"></div>
+        <div></div>
+      </div>
+      <div class="hint">Sobald das Dashboard von außen erreichbar ist, ist ein starkes
+        Passwort Pflicht — der Agent kann Befehle auf dem Rechner ausführen.</div>
+    </div>
+
+    <div class="card">
+      <h2>Anzeige</h2>
+      <div class="checkrow"><input type="checkbox" id="s-showtools"><label for="s-showtools" style="margin:0">Arbeitsschritte im Chat anzeigen</label></div>
+      <div class="checkrow"><input type="checkbox" id="s-showgraph"><label for="s-showgraph" style="margin:0">Aktivitätsgraph in der Seitenleiste anzeigen</label></div>
+    </div>
+
+    <div class="card">
+      <h2>MCP-Server</h2>
+      <div class="desc">Externe Tool-Server im Model-Context-Protocol-Standard —
+        Dateisystem, Kalender, GitHub u.v.m.</div>
       <label>Konfiguration (JSON-Liste)</label>
       <textarea id="s-mcp" placeholder='[{"name":"files","command":"npx","args":["-y","@modelcontextprotocol/server-filesystem","/Users/du/Dokumente"]}]'></textarea>
-      <div class="hint" id="s-mcpstatus">Beispiele: Dateisystem (npx @modelcontextprotocol/server-filesystem),
-        Web (uvx mcp-server-fetch), oder jede URL eines Remote-MCP-Servers via {"name":"x","url":"https://…"}.</div>
+      <div class="hint" id="s-mcpstatus"></div>
     </div>
+
     <div class="btnrow"><button class="btn" onclick="saveSettings()">Alles speichern &amp; neu laden</button>
       <span id="savemsg"></span></div>
   </div>
+
   <div id="chat"></div>
   <div id="suggestions">
     <button>Was weißt du über mich?</button>
@@ -523,19 +646,19 @@ PAGE = """<!doctype html>
     <button>Welche Skills hast du schon gelernt?</button>
   </div>
   <form id="form">
-    <button type="button" class="iconbtn" id="mic" title="Spracheingabe">🎤</button>
-    <input type="text" id="inp" placeholder="Nachricht an Talos…" autocomplete="off" autofocus>
-    <button type="button" class="iconbtn" id="tts" title="Antworten automatisch vorlesen">🔊</button>
-    <button id="send" class="iconbtn">Senden</button>
+    <button type="button" class="iconbtn" id="mic" title="Spracheingabe"><svg class="ic" viewBox="0 0 24 24"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></button>
+    <input type="text" class="chatinp" id="inp" placeholder="Nachricht an Talos …" autocomplete="off" autofocus>
+    <button type="button" class="iconbtn" id="tts" title="Antworten automatisch vorlesen"><svg class="ic" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7M18.5 5.5a9 9 0 0 1 0 13"/></svg></button>
+    <button id="send" class="iconbtn" title="Senden"><svg class="ic" viewBox="0 0 24 24"><path d="m5 12 14-7-4 7 4 7z"/></svg></button>
   </form>
 </main>
 
 <aside>
-  <div id="graphwrap"><canvas id="graph"></canvas><span id="graphlabel">Agenten-Aktivität</span></div>
+  <div id="graphwrap"><canvas id="graph"></canvas><span id="graphlabel">Aktivität</span></div>
   <div class="asidebody">
-    <details open><summary>🧠 Gedächtnis</summary><pre id="memory">–</pre></details>
-    <details><summary>📚 Lektionen</summary><pre id="lessons">–</pre></details>
-    <details><summary>⚡ Skills</summary><pre id="skills">–</pre></details>
+    <details open><summary>Gedächtnis</summary><pre id="memory">–</pre></details>
+    <details><summary>Lektionen</summary><pre id="lessons">–</pre></details>
+    <details><summary>Skills</summary><pre id="skills">–</pre></details>
     <div id="usagebox">
       <div class="row"><span>Session-Kosten</span><span id="u-cost">$0.0000</span></div>
       <div class="row"><span>Tokens ein</span><span id="u-in">0</span></div>
@@ -549,32 +672,43 @@ PAGE = """<!doctype html>
 <script>
 const chat=document.getElementById('chat'),inp=document.getElementById('inp'),
       send=document.getElementById('send'),sugg=document.getElementById('suggestions');
-let mode='chat';
+let mode='chat',UI={tts_default:false,tts_rate:1.05,show_tools:true,show_graph:true};
+const $=id=>document.getElementById(id);
+const TOOLVERB={shell:'führt einen Befehl aus',web_search:'durchsucht das Web',
+  web_fetch:'liest eine Quelle',memory_save:'speichert im Gedächtnis',
+  memory_read:'liest das Gedächtnis',skill_save:'erstellt einen Skill',
+  skill_read:'lädt einen Skill',delegate:'arbeitet mit einem Subagenten'};
+function toolVerb(name){if(TOOLVERB[name])return TOOLVERB[name];
+  if(name.startsWith('mcp__'))return 'nutzt '+name.split('__')[1];return 'arbeitet ('+name+')'}
 
 function el(cls,html){const d=document.createElement('div');d.className=cls;
   if(html!==undefined)d.innerHTML=html;chat.appendChild(d);chat.scrollTop=chat.scrollHeight;return d}
-function addUser(t){const d=el('msg user');d.textContent=t}
-function addBot(t){const d=el('msg bot',marked.parse(t));
-  const b=document.createElement('button');b.className='speakbtn';b.textContent='🔊';
-  b.title='Vorlesen';b.onclick=()=>speak(t,true);d.appendChild(b)}
-function addTool(t){el('tool','⚙ '+t.name+(t.detail?': '+t.detail:''))}
+function addUser(t){const d=el('turn-user');d.textContent=t}
+function addBot(t){
+  const d=el('turn-bot');
+  d.innerHTML='<div class="mark">◈</div><div class="body"></div>';
+  const body=d.querySelector('.body');body.innerHTML=marked.parse(t);
+  const act=document.createElement('div');act.className='actions';
+  const sp=document.createElement('button');sp.title='Vorlesen';
+  sp.innerHTML='<svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><path d="M11 5 6 9H3v6h3l5 4zM15.5 8.5a5 5 0 0 1 0 7"/></svg>Vorlesen';
+  sp.onclick=()=>speak(t,true);act.appendChild(sp);body.appendChild(act);
+  chat.scrollTop=chat.scrollHeight;return d}
 
-// ===== Verbrauch (Claude-Code-Stil) =====
+// ===== Verbrauch =====
 function updateUsage(u){if(!u)return;
-  document.getElementById('u-cost').textContent='$'+u.cost.toFixed(4);
-  document.getElementById('u-in').textContent=u.input.toLocaleString('de-DE');
-  document.getElementById('u-out').textContent=u.output.toLocaleString('de-DE');
+  $('u-cost').textContent='$'+u.cost.toFixed(4);
+  $('u-in').textContent=u.input.toLocaleString('de-DE');
+  $('u-out').textContent=u.output.toLocaleString('de-DE');
   const pct=Math.min(100,Math.round(u.context/u.window*100));
-  document.getElementById('u-ctx').textContent=
-    pct+'% ('+(u.context/1000).toFixed(1)+'k / '+(u.window/1000)+'k)';
-  const f=document.getElementById('ctxfill');f.style.width=pct+'%';
+  $('u-ctx').textContent=pct+'% ('+(u.context/1000).toFixed(1)+'k / '+(u.window/1000)+'k)';
+  const f=$('ctxfill');f.style.width=pct+'%';
   f.className=pct>80?'crit':pct>50?'warn':''}
 
-// ===== Sprachausgabe: ElevenLabs, Fallback Browser-Stimme =====
+// ===== Sprachausgabe =====
 let ttsOn=false,voices=[],audioEl=null;
 function loadVoices(){voices=speechSynthesis.getVoices()}
 loadVoices();speechSynthesis.onvoiceschanged=loadVoices;
-const ttsBtn=document.getElementById('tts');
+const ttsBtn=$('tts');
 ttsBtn.onclick=()=>{ttsOn=!ttsOn;ttsBtn.classList.toggle('on',ttsOn);
   if(ttsOn){speak('Sprachausgabe aktiviert.',true)}else{stopSpeaking()}};
 function stopSpeaking(){speechSynthesis.cancel();
@@ -586,36 +720,35 @@ async function speak(text,force){
   if(!ttsOn&&!force)return;
   stopSpeaking();
   const plain=plainText(text);if(!plain)return;
-  // 1. Versuch: ElevenLabs über den Server
   try{
     const r=await fetch('/api/tts',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({text:plain})});
     if(r.ok&&(r.headers.get('content-type')||'').includes('audio')){
-      audioEl=new Audio(URL.createObjectURL(await r.blob()));audioEl.play();return}
+      audioEl=new Audio(URL.createObjectURL(await r.blob()));
+      audioEl.playbackRate=UI.tts_rate||1;audioEl.play();return}
   }catch(e){}
-  // 2. Fallback: Browser-Stimme (in Sätzen — lange Utterances brechen ab)
   const voice=voices.find(v=>v.lang==='de-DE')||voices.find(v=>v.lang.startsWith('de'));
   const parts=plain.match(/[^.!?]+[.!?]*/g)||[plain];
   for(const p of parts){const u=new SpeechSynthesisUtterance(p.trim());
-    u.lang='de-DE';u.rate=1.05;if(voice)u.voice=voice;speechSynthesis.speak(u)}
+    u.lang='de-DE';u.rate=UI.tts_rate||1.05;if(voice)u.voice=voice;speechSynthesis.speak(u)}
   clearInterval(window._ttsKick);
   window._ttsKick=setInterval(()=>{if(!speechSynthesis.speaking)clearInterval(window._ttsKick);
     else{speechSynthesis.pause();speechSynthesis.resume()}},10000)}
 
-// ===== Spracheingabe (Mikrofon) =====
-const micBtn=document.getElementById('mic');
+// ===== Spracheingabe =====
+const micBtn=$('mic');
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
 if(!SR){micBtn.style.display='none'}
 else{const rec=new SR();rec.lang='de-DE';rec.interimResults=true;let listening=false;
   micBtn.onclick=()=>{if(listening){rec.stop();return}
-    rec.start();listening=true;micBtn.classList.add('active');micBtn.textContent='⏹'};
+    rec.start();listening=true;micBtn.classList.add('rec')};
   rec.onresult=e=>{inp.value=Array.from(e.results).map(r=>r[0].transcript).join('')};
-  rec.onend=()=>{listening=false;micBtn.classList.remove('active');micBtn.textContent='🎤';
+  rec.onend=()=>{listening=false;micBtn.classList.remove('rec');
     if(inp.value.trim())document.getElementById('form').requestSubmit()};
-  rec.onerror=()=>{listening=false;micBtn.classList.remove('active');micBtn.textContent='🎤'}}
+  rec.onerror=()=>{listening=false;micBtn.classList.remove('rec')}}
 
-// ===== Live-Aktivitätsgraph (rechte Seite) =====
-const cv=document.getElementById('graph'),gctx=cv.getContext('2d');
+// ===== Aktivitätsgraph =====
+const cv=$('graph'),gctx=cv.getContext('2d');
 function gsize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=cv.clientHeight*devicePixelRatio;
   gctx.setTransform(devicePixelRatio,0,0,devicePixelRatio,0,0)}
 addEventListener('resize',gsize);
@@ -656,9 +789,8 @@ function drawGraph(t){const W=cv.clientWidth,H=cv.clientHeight;
   requestAnimationFrame(drawGraph)}
 gsize();initGraph();requestAnimationFrame(drawGraph);
 
-// ===== Obsidian-Wissensgraph =====
-const kview=document.getElementById('knowview'),kcv=document.getElementById('kcanvas'),
-      kctx=kcv.getContext('2d'),kdetail=document.getElementById('kdetail');
+// ===== Wissensgraph =====
+const kview=$('knowview'),kcv=$('kcanvas'),kctx=kcv.getContext('2d'),kdetail=$('kdetail');
 const KCOLORS={hub:'#ffffff',memory:'#bf5af2',skill:'#30d158',lesson:'#ff9f0a'};
 let knodes=[],klinks=[],kcam={x:0,y:0,z:1},kdrag=null,kpan=null,kactive=false;
 function ksize(){kcv.width=kcv.clientWidth*devicePixelRatio;kcv.height=kcv.clientHeight*devicePixelRatio}
@@ -672,17 +804,14 @@ async function loadKnowledge(){
   klinks=d.links.map(l=>({a:byId[l.a],b:byId[l.b]})).filter(l=>l.a&&l.b);
   const t=byId['talos'];if(t){t.x=W/2;t.y=H/2}}
 function kstep(){
-  // Abstoßung zwischen allen Knoten
   for(let i=0;i<knodes.length;i++)for(let j=i+1;j<knodes.length;j++){
     const a=knodes[i],b=knodes[j];let dx=b.x-a.x,dy=b.y-a.y;
     let d2=dx*dx+dy*dy;if(d2<1)d2=1;const d=Math.sqrt(d2);
     const f=Math.min(1200/d2,4);dx/=d;dy/=d;
     a.vx-=dx*f;a.vy-=dy*f;b.vx+=dx*f;b.vy+=dy*f}
-  // Federn entlang der Kanten
   for(const l of klinks){let dx=l.b.x-l.a.x,dy=l.b.y-l.a.y;
     const d=Math.sqrt(dx*dx+dy*dy)||1,f=(d-70)*.01;dx/=d;dy/=d;
     l.a.vx+=dx*f*d*.02;l.a.vy+=dy*f*d*.02;l.b.vx-=dx*f*d*.02;l.b.vy-=dy*f*d*.02}
-  // leichte Zentrierung + Dämpfung
   const W=kcv.clientWidth,H=kcv.clientHeight;
   for(const n of knodes){
     n.vx+=(W/2-n.x)*.0006;n.vy+=(H/2-n.y)*.0006;
@@ -724,20 +853,19 @@ kcv.addEventListener('wheel',e=>{e.preventDefault();
 async function showKnowledge(){
   hideSettings();
   document.body.classList.add('knowledge');kview.classList.add('show');
-  document.getElementById('modetitle').textContent='Wissen';
-  document.getElementById('mode-wissen').classList.add('active');
-  document.getElementById('mode-chat').classList.remove('active');
-  document.getElementById('mode-coden').classList.remove('active');
+  $('modetitle').textContent='Wissen';
+  $('mode-wissen').classList.add('active');
+  $('mode-chat').classList.remove('active');$('mode-coden').classList.remove('active');
   ksize();kcam={x:0,y:0,z:1};kdetail.style.display='none';
   await loadKnowledge();
   if(!kactive){kactive=true;requestAnimationFrame(kdraw)}}
 function hideKnowledge(){document.body.classList.remove('knowledge');
   kview.classList.remove('show');kactive=false;
-  document.getElementById('mode-wissen').classList.remove('active')}
+  $('mode-wissen').classList.remove('active')}
 addEventListener('resize',()=>{if(kactive)ksize()});
 
 // ===== Einstellungen =====
-const setview=document.getElementById('setview');
+const setview=$('setview');
 const PRESETS={
  'Anthropic':{base_url:'https://api.anthropic.com/v1/',model:'claude-opus-4-8',small_model:'claude-haiku-4-5'},
  'OpenAI':{base_url:'https://api.openai.com/v1',model:'gpt-4o',small_model:'gpt-4o-mini'},
@@ -747,7 +875,6 @@ const PRESETS={
  'Ollama (lokal)':{base_url:'http://localhost:11434/v1',model:'qwen3:14b',small_model:'qwen3:4b',api_key:'none'},
  'vLLM (lokal)':{base_url:'http://localhost:8000/v1',model:'',small_model:'',api_key:'none'}};
 let SETTINGS=null;
-const $=id=>document.getElementById(id);
 function fillProviderForm(name){
   const p=SETTINGS.providers.find(x=>x.name===name);if(!p)return;
   $('s-name').value=p.name;$('s-url').value=p.base_url||'';
@@ -768,8 +895,21 @@ async function showSettings(){
   for(const k of Object.keys(PRESETS)){const o=document.createElement('option');
     o.value=k;o.textContent=k;ps.appendChild(o)}
   renderProviders();
-  $('s-elkey').value=SETTINGS.eleven_key||'';$('s-elvoice').value=SETTINGS.eleven_voice||'';
+  $('s-persona').value=SETTINGS.persona||'';
+  $('s-rounds').value=SETTINGS.max_tool_rounds||20;
+  $('s-compact').value=SETTINGS.compact_chars||60000;
+  $('s-window').value=SETTINGS.context_window||200000;
   $('s-verify').checked=!!SETTINGS.verify;
+  $('s-subagents').checked=SETTINGS.subagents!==false;
+  $('s-shell').checked=SETTINGS.shell_enabled!==false;
+  $('s-elkey').value=SETTINGS.eleven_key||'';$('s-elvoice').value=SETTINGS.eleven_voice||'';
+  $('s-elrate').value=SETTINGS.tts_rate||1.05;
+  $('s-ttsdefault').checked=!!SETTINGS.tts_default;
+  $('s-tgtoken').value=SETTINGS.telegram_token||'';
+  $('s-tgallowed').value=SETTINGS.telegram_allowed||'';
+  $('s-webpw').value=SETTINGS.web_password||'';
+  $('s-showtools').checked=SETTINGS.show_tools!==false;
+  $('s-showgraph').checked=SETTINGS.show_graph!==false;
   $('s-mcp').value=SETTINGS.mcp_servers.length?JSON.stringify(SETTINGS.mcp_servers,null,1):'';
   if(SETTINGS.mcp_status){const st=SETTINGS.mcp_status;
     $('s-mcpstatus').textContent='Verbunden: '+st.servers.join(', ')+' ('+st.tools+' Tools)'+
@@ -797,49 +937,80 @@ function deleteProvider(){
 async function saveSettings(){
   let mcp=[];const raw=$('s-mcp').value.trim();
   if(raw){try{mcp=JSON.parse(raw)}catch(e){$('savemsg').textContent='MCP-JSON ungültig: '+e;return}}
-  SETTINGS.eleven_key=$('s-elkey').value.trim();
-  SETTINGS.eleven_voice=$('s-elvoice').value.trim();
-  SETTINGS.verify=$('s-verify').checked;SETTINGS.mcp_servers=mcp;
+  Object.assign(SETTINGS,{
+    persona:$('s-persona').value.trim(),
+    max_tool_rounds:parseInt($('s-rounds').value)||20,
+    compact_chars:parseInt($('s-compact').value)||60000,
+    context_window:parseInt($('s-window').value)||200000,
+    verify:$('s-verify').checked,
+    subagents:$('s-subagents').checked,
+    shell_enabled:$('s-shell').checked,
+    eleven_key:$('s-elkey').value.trim(),
+    eleven_voice:$('s-elvoice').value.trim(),
+    tts_rate:parseFloat($('s-elrate').value)||1.05,
+    tts_default:$('s-ttsdefault').checked,
+    telegram_token:$('s-tgtoken').value.trim(),
+    telegram_allowed:$('s-tgallowed').value.trim(),
+    web_password:$('s-webpw').value.trim(),
+    show_tools:$('s-showtools').checked,
+    show_graph:$('s-showgraph').checked,
+    mcp_servers:mcp});
   const r=await (await fetch('/api/settings',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify(SETTINGS)})).json();
-  $('savemsg').textContent='Gespeichert ✓ Modell: '+r.model+
+  $('savemsg').textContent='Gespeichert — Modell: '+r.model+
     (r.mcp_status?' · MCP: '+r.mcp_status.tools+' Tools':'');
   refreshState()}
 
 // ===== Sessions / Verlauf / Modus =====
 async function refreshSessions(){const s=await (await fetch('/api/sessions')).json();
-  const h=document.getElementById('history');h.innerHTML='';
-  for(const sess of s.sessions){const b=document.createElement('button');
-    b.textContent=(sess.mode==='coden'?'⌨️ ':'')+sess.title;
-    if(sess.id===s.current)b.className='active';
-    b.onclick=()=>loadSession(sess.id);h.appendChild(b)}}
-function setModeUI(){document.getElementById('mode-chat').classList.toggle('active',mode==='chat');
-  document.getElementById('mode-coden').classList.toggle('active',mode==='coden');
-  document.getElementById('modetitle').textContent=mode==='coden'?'Coden':'Chat';
-  inp.placeholder=mode==='coden'?'Was soll ich bauen?':'Nachricht an Talos…'}
+  const h=$('history');h.innerHTML='';
+  for(const sess of s.sessions){
+    const row=document.createElement('div');row.className='hrow'+(sess.id===s.current?' active':'');
+    const b=document.createElement('button');b.className='title';
+    b.textContent=sess.title;b.title=sess.title;
+    b.onclick=()=>loadSession(sess.id);row.appendChild(b);
+    const del=document.createElement('button');del.className='del iconbtn';
+    del.title='Chat löschen';
+    del.innerHTML='<svg class="ic" style="width:13px;height:13px" viewBox="0 0 24 24"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg>';
+    del.onclick=async ev=>{ev.stopPropagation();
+      if(!confirm('Diesen Chat endgültig löschen?'))return;
+      await fetch('/api/session/'+sess.id,{method:'DELETE'});
+      if(sess.id===s.current){chat.innerHTML='';sugg.style.display='flex';initGraph()}
+      refreshSessions()};
+    row.appendChild(del);h.appendChild(row)}}
+function setModeUI(){$('mode-chat').classList.toggle('active',mode==='chat');
+  $('mode-coden').classList.toggle('active',mode==='coden');
+  $('modetitle').textContent=mode==='coden'?'Coden':'Chat';
+  inp.placeholder=mode==='coden'?'Was soll ich bauen?':'Nachricht an Talos …'}
 async function setMode(m){hideKnowledge();hideSettings();mode=m;await newSession()}
-async function newSession(){hideKnowledge();hideSettings();await fetch('/api/session/new',{method:'POST',
+async function newSession(){hideKnowledge();hideSettings();
+  await fetch('/api/session/new',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})});
   chat.innerHTML='';sugg.style.display='flex';initGraph();setModeUI();
   refreshSessions();refreshState()}
-async function loadSession(id){hideKnowledge();hideSettings();const r=await (await fetch('/api/session/load',{method:'POST',
+async function loadSession(id){hideKnowledge();hideSettings();
+  const r=await (await fetch('/api/session/load',{method:'POST',
     headers:{'Content-Type':'application/json'},body:JSON.stringify({id,mode})})).json();
   if(r.error)return;chat.innerHTML='';sugg.style.display='none';initGraph();
   for(const m of r.history){m.role==='user'?addUser(m.text):addBot(m.text)}
   refreshSessions();refreshState()}
 
 async function refreshState(){const s=await (await fetch('/api/state')).json();
-  document.getElementById('memory').textContent=s.memory||'(leer)';
-  document.getElementById('lessons').textContent=s.lessons||'(keine)';
-  document.getElementById('skills').textContent=s.skills||'(keine)';
-  document.getElementById('model').textContent=s.model;
-  mode=s.mode||'chat';setModeUI();updateUsage(s.usage)}
+  $('memory').textContent=s.memory||'(leer)';
+  $('lessons').textContent=s.lessons||'(keine)';
+  $('skills').textContent=s.skills||'(keine)';
+  $('model').textContent=s.model;
+  mode=s.mode||'chat';setModeUI();updateUsage(s.usage);
+  if(s.ui){UI=s.ui;
+    document.getElementById('graphwrap').style.display=UI.show_graph?'block':'none';
+    if(UI.tts_default&&!ttsOn){ttsOn=true;ttsBtn.classList.add('on')}}}
 
 // ===== Chat mit Live-Streaming =====
 async function sendMessage(text){
   addUser(text);sugg.style.display='none';send.disabled=true;
   busy=true;hub=gnodes[0];
-  const typing=el('typing');
+  const steps=[];
+  const status=el('working','<span class="pulse"></span><span class="label">Talos denkt nach …</span>');
   try{
     const resp=await fetch('/api/chat/stream',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify({message:text})});
@@ -850,10 +1021,20 @@ async function sendMessage(text){
         const line=buf.slice(0,idx).trim();buf=buf.slice(idx+2);
         if(!line.startsWith('data: '))continue;
         const ev=JSON.parse(line.slice(6));
-        if(ev.type==='tool'){addTool(ev);addGraphNode(ev.name)}
-        else if(ev.type==='reply'){typing.remove();addBot(ev.text);speak(ev.text);
-          updateUsage(ev.usage)}}}
-  }catch(err){typing.remove();addBot('**Fehler:** '+err)}
+        if(ev.type==='tool'){
+          steps.push(ev);addGraphNode(ev.name);
+          if(UI.show_tools)status.querySelector('.label').textContent='Talos '+toolVerb(ev.name)+' …';
+          chat.scrollTop=chat.scrollHeight}
+        else if(ev.type==='reply'){
+          status.remove();
+          if(UI.show_tools&&steps.length){
+            const det=document.createElement('details');det.className='steps';
+            det.innerHTML='<summary>'+steps.length+' Arbeitsschritte</summary>'+
+              steps.map(s=>'<div class="step">'+toolVerb(s.name)+
+                (s.detail?' — '+s.detail.replace(/</g,'&lt;'):'')+'</div>').join('');
+            chat.appendChild(det)}
+          addBot(ev.text);speak(ev.text);updateUsage(ev.usage)}}}
+  }catch(err){status.remove();addBot('**Fehler:** '+err)}
   busy=false;hub=gnodes[0];
   send.disabled=false;inp.focus();refreshSessions()}
 
@@ -874,13 +1055,13 @@ def main() -> None:
 
     host = os.getenv("TALOS_WEB_HOST", "127.0.0.1")
     port = int(os.getenv("TALOS_WEB_PORT", "7777"))
-    if host != "127.0.0.1" and not _WEB_PASSWORD:
+    if host != "127.0.0.1" and not _password():
         raise SystemExit(
             "SICHERHEIT: Öffentlicher Host ohne TALOS_WEB_PASSWORD verweigert. "
             "Setze TALOS_WEB_PASSWORD, bevor du das Dashboard nach außen öffnest."
         )
     where = f"http://{host}:{port}" if host != "127.0.0.1" else f"http://localhost:{port}"
-    print(f"TalosAI Dashboard: {where}" + ("  (passwortgeschützt)" if _WEB_PASSWORD else ""))
+    print(f"TalosAI Dashboard: {where}" + ("  (passwortgeschützt)" if _password() else ""))
     uvicorn.run(app, host=host, port=port, log_level="warning")
 
 

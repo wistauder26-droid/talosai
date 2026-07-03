@@ -22,6 +22,19 @@ talos-web                    # lokales Dashboard: http://localhost:7777
 talos-telegram               # oder als Telegram-Bot
 ```
 
+### Native Mac-App
+
+Ein eigenes Programmfenster (kein Browser), per Doppelklick startbar:
+
+```bash
+uv pip install -p .venv/bin/python '.[app]'   # pywebview
+bash scripts/build-mac-app.sh                 # erzeugt TalosAI.app
+```
+
+Danach `TalosAI.app` in den Ordner **Programme** ziehen. Alternativ direkt
+`talos-app` starten. Auf Linux/Windows funktioniert `talos-app` ebenso
+(pywebview nutzt das jeweilige System-WebView).
+
 ### Docker
 
 ```bash

@@ -16,10 +16,14 @@ dependencies = [
     "mcp>=1.0",
 ]
 
+[project.optional-dependencies]
+app = ["pywebview>=5"]
+
 [project.scripts]
 talos = "talos.cli:main"
 talos-telegram = "talos.gateway.telegram:main"
 talos-web = "talos.webapp:main"
+talos-app = "talos.app:main"
 
 [build-system]
 requires = ["hatchling"]
